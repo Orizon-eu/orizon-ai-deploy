@@ -383,7 +383,7 @@ class Wizard:
         ui.header("Models")
         if self.gpus:
             for g in self.gpus:
-                ui.kv(f"GPU {g.index}", f"{g.name}, {g.memory_mib // 1024} GiB, driver {g.driver}")
+                ui.kv(f"GPU {g.index}", f"{g.name}, {g.memory_label()}, driver {g.driver}")
         else:
             ui.info("No NVIDIA GPU detected: every model has to come from an external OpenAI-compatible endpoint.")
 
