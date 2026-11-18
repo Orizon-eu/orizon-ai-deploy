@@ -1,0 +1,52 @@
+# AppArmor profile for RootlessKit, which is what starts the rootless Docker
+# daemon inside the sandbox-dind sidecar (docker-compose.mcp.yml).
+#
+# WHY THIS IS NEEDED. Ubuntu 23.10 and later ship
+# kernel.apparmor_restrict_unprivileged_userns=1. Under it, an unconfined
+# process that asks for an unprivileged user namespace is transitioned into the
+# stock `unprivileged_userns` profile, which denies every capability — including
+# CAP_SYS_ADMIN, which is exactly what RootlessKit needs to build the namespace.
+# The daemon then dies before it starts:
+#
+#   [rootlesskit:parent] error: failed to start the child:
+#   fork/exec /proc/self/exe: operation not permitted
+#
+# and the host audit log says why:
+#
+#   apparmor="DENIED" operation="capable" profile="unprivileged_userns"
+#   comm="rootlesskit" capability=21 capname="sys_admin"
+#
+# The transition is decided by the HOST kernel from the executable's path, so no
+# amount of `privileged: true` or `security_opt:` on the container reaches it —
+# all three were tried and all three fail identically. The fix has to be a host
+# profile, and this is the narrowest one: it names a single binary and grants it
+# the one permission it was denied, leaving the restriction in force for
+# everything else on the machine.
+#
+# This is the same shape Ubuntu ships for lxc-usernsexec and opam
+# (/etc/apparmor.d/), which need the namespace for the same reason.
+#
+# INSTALL (on the Docker host, not in a container):
+#   sudo cp apparmor/rootlesskit /etc/apparmor.d/rootlesskit
+#   sudo apparmor_parser -r /etc/apparmor.d/rootlesskit
+#   docker compose -f docker-compose.mcp.yml up -d sandbox-dind
+#
+# It survives reboots; /etc/apparmor.d is loaded at boot.
+#
+# VERIFY it took:
+#   docker compose -f docker-compose.mcp.yml exec sandbox-dind \
+#     docker -H tcp://localhost:2375 info | grep -i "rootless\|cgroup"
+#
+# The path is the one INSIDE the sandbox-dind image, which is where the binary
+# actually lives; `execpath=` in the audit line above is what confirms it. A
+# future base image that moves the binary needs this path moved with it.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile rootlesskit /usr/local/bin/rootlesskit flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/rootlesskit>
+}

@@ -1,0 +1,793 @@
+# ---------------------------------------------------------------------------
+# MCP Servers — separate compose file
+#
+# The main docker-compose.yml owns the orizon-network. Bring it up first,
+# then this file joins that network as an external reference.
+#
+# Usage:
+#   docker compose up -d                              # creates the network
+#   docker compose -f docker-compose.mcp.yml up -d    # joins it
+#
+# All MCP containers reach the backend over orizon-network at
+# http://mcp-<slug>:<port>/mcp. They are exposed to the host for local
+# development but never proxied through nginx.
+#
+# Each container reads .env.mcp and not .env: the ports, the host allowlist,
+# the per-connector timeouts and the sandbox runtime image, and none of the stack
+# configuration. Which tenant and which OAuth application a connector uses are
+# panel settings, sent per request as X-Mcp-* headers.
+#
+# Two names in .env.mcp reach their containers through `env_file` rather than a
+# `${...}` interpolation, and the difference matters when editing this file:
+# interpolation resolves only against the root .env, so SANDBOX_IMAGE and
+# SANDBOX_PACKAGES must not be written as `${SANDBOX_IMAGE}` anywhere here. An
+# `environment:` line would also override `env_file`, silently substituting the
+# interpolation fallback for the value the operator set.
+#
+# ── The code sandbox (mcp-sandbox) ───────────────────────────────────
+# Unlike the API connectors, mcp-sandbox needs a second image: the runtime image
+# that untrusted snippets execute in. It needs no separate step. The
+# sandbox-image-loader service pulls it when SANDBOX_IMAGE is a registry tag and
+# otherwise builds it inside the sandbox daemon, from the SANDBOX_PACKAGES it
+# reads out of .env.mcp, and rebuilds it whenever either that list or
+# Dockerfile.sandbox-runtime changes. Adding a library, or a font, is one edit
+# followed by `up -d`. The first build takes a few minutes and produces ~1GB.
+#
+# To rebuild when neither input changed but the image is still wrong:
+#   docker compose -f docker-compose.mcp.yml run --rm \
+#     -e SANDBOX_IMAGE_REBUILD=true sandbox-image-loader
+#
+# To publish it instead, so deployments pull a fixed tag:
+#   set -a; . ./.env.mcp; set +a
+#   docker build -f mcp-servers/Dockerfile.sandbox-runtime \
+#     --build-arg SANDBOX_PACKAGES="$SANDBOX_PACKAGES" \
+#     --build-arg SANDBOX_RECIPE="$(sha256sum mcp-servers/Dockerfile.sandbox-runtime | cut -c1-16)" \
+#     -t "$SANDBOX_IMAGE" .
+#   docker push "$SANDBOX_IMAGE"
+# Bump SANDBOX_IMAGE in .env.mcp when either input changes, or the loader warns
+# that the pulled image and what this checkout describes disagree.
+#
+# ── Adding a new MCP server ──────────────────────────────────────────
+# 1. Write a FastMCP server (or drop in a submodule) under mcp-servers/
+# 2. Create mcp-servers/Dockerfile.<slug>  (copy Dockerfile.hubspot)
+# 3. Copy the mcp-hubspot service block below, change:
+#      - service name, image, container_name
+#      - MCP_PORT (use next available: 8111, 8112, …; a customer-specific
+#        server attached as external takes the next from 8300: 8300 is okasa)
+#      - MCP_CRED_VARS="" if the server needs no credentials
+# 4. Add an HTTP entry to app/config/mcp_servers.json:
+#      "transport": "http",  "url": "http://mcp-<slug>:<port>/mcp"
+# 5. docker compose -f docker-compose.mcp.yml up -d --build mcp-<slug>
+#
+# ── Removing an MCP server ───────────────────────────────────────────
+# 1. Remove or comment out the service block below
+# 2. Remove its entry from app/config/mcp_servers.json
+# 3. docker compose -f docker-compose.mcp.yml up -d
+#
+# ── Customer-specific servers (profiles) ─────────────────────────────
+# mcp-okasa is not a built-in connector: it has no manifest entry and is
+# attached from Settings > External MCP on the one deployment that uses it, at
+# http://mcp-okasa:8300/mcp. It runs only under its own profile or the shared
+# `external` one, so every other deployment never pulls or starts it. On that
+# server add one of them to COMPOSE_PROFILES in the root .env, e.g.
+#   COMPOSE_PROFILES=transcription,okasa
+# then `docker compose -f docker-compose.mcp.yml up -d mcp-okasa`. To stop it,
+# remove the profile and run `docker compose -f docker-compose.mcp.yml rm -sf
+# mcp-okasa`. It publishes no host port and reads no .env.mcp: it is reached
+# only by the backend, and its allowlist is its own, so the shared one in
+# .env.mcp never has to name it.
+# ---------------------------------------------------------------------------
+
+services:
+  mcp-hubspot:
+    image: ${ORIZON_IMAGE_PREFIX:-scr.syneto.eu/orizon-ai/orizon-ai}/orizon-mcp-hubspot:${ORIZON_VERSION:-v1.0.0}
+    build:
+      context: .
+      dockerfile: mcp-servers/Dockerfile.hubspot
+    container_name: orizon-mcp-hubspot
+    env_file:
+      - .env.mcp
+    environment:
+      # MCP_HUBSPOT_PORT comes from .env.mcp; Dockerfile falls back to 8100
+      MCP_PORT: "${MCP_HUBSPOT_PORT:-8100}"
+      # Forward Authorization: Bearer <token> → ACCESS_TOKEN env var per request
+      MCP_CRED_VARS: "ACCESS_TOKEN"
+      # MCP_CLIENT_ATTR no longer used (contextvars replaced os.environ injection)
+      MCP_CLIENT_ATTR: "_client"
+    ports:
+      - "${MCP_HUBSPOT_PORT:-8100}:${MCP_HUBSPOT_PORT:-8100}"
+    networks:
+      - orizon-network
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import socket,os; socket.create_connection(('localhost', int(os.environ.get('MCP_PORT',8100))), timeout=5).close()"
+      interval: ${HEALTHCHECK_INTERVAL:-30s}
+      timeout: ${HEALTHCHECK_TIMEOUT:-10s}
+      start_period: 15s
+      retries: ${HEALTHCHECK_RETRIES:-3}
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 64M
+          cpus: "0.1"
+
+  mcp-freshdesk:
+    image: ${ORIZON_IMAGE_PREFIX:-scr.syneto.eu/orizon-ai/orizon-ai}/orizon-mcp-freshdesk:${ORIZON_VERSION:-v1.0.0}
+    build:
+      context: .
+      dockerfile: mcp-servers/Dockerfile.freshdesk
+    container_name: orizon-mcp-freshdesk
+    env_file:
+      - .env.mcp
+    environment:
+      MCP_PORT: "${MCP_FRESHDESK_PORT:-8101}"
+      # Forward Authorization: Bearer <api_key> → API_KEY env var per request
+      MCP_CRED_VARS: "API_KEY"
+      # No COMPANY_DOMAIN here. The backend sends it per request as an
+      # X-Mcp-COMPANY_DOMAIN header, from Settings > System > Connectors, so an
+      # admin can change which Freshdesk this talks to without recreating this
+      # container. A value here would only be read when the server runs standalone.
+    ports:
+      - "${MCP_FRESHDESK_PORT:-8101}:${MCP_FRESHDESK_PORT:-8101}"
+    networks:
+      - orizon-network
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import socket,os; socket.create_connection(('localhost', int(os.environ.get('MCP_PORT',8101))), timeout=5).close()"
+      interval: ${HEALTHCHECK_INTERVAL:-30s}
+      timeout: ${HEALTHCHECK_TIMEOUT:-10s}
+      start_period: 15s
+      retries: ${HEALTHCHECK_RETRIES:-3}
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 64M
+          cpus: "0.1"
+
+  mcp-freshcaller:
+    image: ${ORIZON_IMAGE_PREFIX:-scr.syneto.eu/orizon-ai/orizon-ai}/orizon-mcp-freshcaller:${ORIZON_VERSION:-v1.0.0}
+    build:
+      context: .
+      dockerfile: mcp-servers/Dockerfile.freshcaller
+    container_name: orizon-mcp-freshcaller
+    env_file:
+      - .env.mcp
+    environment:
+      MCP_PORT: "${MCP_FRESHCALLER_PORT:-8102}"
+      # Forward Authorization: Bearer <api_key> → API_KEY env var per request
+      MCP_CRED_VARS: "API_KEY"
+      # Sent per request as X-Mcp-COMPANY_DOMAIN, like the Freshdesk one above.
+    ports:
+      - "${MCP_FRESHCALLER_PORT:-8102}:${MCP_FRESHCALLER_PORT:-8102}"
+    networks:
+      - orizon-network
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import socket,os; socket.create_connection(('localhost', int(os.environ.get('MCP_PORT',8102))), timeout=5).close()"
+      interval: ${HEALTHCHECK_INTERVAL:-30s}
+      timeout: ${HEALTHCHECK_TIMEOUT:-10s}
+      start_period: 15s
+      retries: ${HEALTHCHECK_RETRIES:-3}
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 64M
+          cpus: "0.1"
+
+  mcp-salesforce:
+    image: ${ORIZON_IMAGE_PREFIX:-scr.syneto.eu/orizon-ai/orizon-ai}/orizon-mcp-salesforce:${ORIZON_VERSION:-v1.0.0}
+    build:
+      context: .
+      dockerfile: mcp-servers/Dockerfile.salesforce
+    container_name: orizon-mcp-salesforce
+    env_file:
+      - .env.mcp
+    environment:
+      MCP_PORT: "${MCP_SALESFORCE_PORT:-8103}"
+      # Forward Authorization: Bearer <token> → ACCESS_TOKEN contextvar per request.
+      # INSTANCE_URL is injected via X-Mcp-INSTANCE_URL header (per-user, from vault).
+      MCP_CRED_VARS: "ACCESS_TOKEN"
+    ports:
+      - "${MCP_SALESFORCE_PORT:-8103}:${MCP_SALESFORCE_PORT:-8103}"
+    networks:
+      - orizon-network
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import socket,os; socket.create_connection(('localhost', int(os.environ.get('MCP_PORT',8103))), timeout=5).close()"
+      interval: ${HEALTHCHECK_INTERVAL:-30s}
+      timeout: ${HEALTHCHECK_TIMEOUT:-10s}
+      start_period: 15s
+      retries: ${HEALTHCHECK_RETRIES:-3}
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 64M
+          cpus: "0.1"
+
+  mcp-atlassian:
+    image: ${ORIZON_IMAGE_PREFIX:-scr.syneto.eu/orizon-ai/orizon-ai}/orizon-mcp-atlassian:${ORIZON_VERSION:-v1.0.0}
+    build:
+      context: .
+      dockerfile: mcp-servers/Dockerfile.atlassian
+    container_name: orizon-mcp-atlassian
+    env_file:
+      - .env.mcp
+    environment:
+      MCP_PORT: "${MCP_ATLASSIAN_PORT:-8108}"
+      # Forward Authorization: Bearer <token> → ACCESS_TOKEN contextvar per request.
+      # CLOUD_ID is injected via X-Mcp-CLOUD_ID header (per-user, from the vault):
+      # it names which Atlassian site that user's token was issued for, and the
+      # client cannot build a gateway URL without it.
+      MCP_CRED_VARS: "ACCESS_TOKEN"
+    ports:
+      - "${MCP_ATLASSIAN_PORT:-8108}:${MCP_ATLASSIAN_PORT:-8108}"
+    networks:
+      - orizon-network
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import socket,os; socket.create_connection(('localhost', int(os.environ.get('MCP_PORT',8108))), timeout=5).close()"
+      interval: ${HEALTHCHECK_INTERVAL:-30s}
+      timeout: ${HEALTHCHECK_TIMEOUT:-10s}
+      start_period: 15s
+      retries: ${HEALTHCHECK_RETRIES:-3}
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 64M
+          cpus: "0.1"
+
+  mcp-github:
+    image: ${ORIZON_IMAGE_PREFIX:-scr.syneto.eu/orizon-ai/orizon-ai}/orizon-mcp-github:${ORIZON_VERSION:-v1.0.0}
+    build:
+      context: .
+      dockerfile: mcp-servers/Dockerfile.github
+    container_name: orizon-mcp-github
+    env_file:
+      - .env.mcp
+    environment:
+      MCP_PORT: "${MCP_GITHUB_PORT:-8109}"
+      MCP_CRED_VARS: "ACCESS_TOKEN"
+    ports:
+      - "${MCP_GITHUB_PORT:-8109}:${MCP_GITHUB_PORT:-8109}"
+    networks:
+      - orizon-network
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import socket,os; socket.create_connection(('localhost', int(os.environ.get('MCP_PORT',8109))), timeout=5).close()"
+      interval: ${HEALTHCHECK_INTERVAL:-30s}
+      timeout: ${HEALTHCHECK_TIMEOUT:-10s}
+      start_period: 15s
+      retries: ${HEALTHCHECK_RETRIES:-3}
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 64M
+          cpus: "0.1"
+
+  mcp-gitlab:
+    image: ${ORIZON_IMAGE_PREFIX:-scr.syneto.eu/orizon-ai/orizon-ai}/orizon-mcp-gitlab:${ORIZON_VERSION:-v1.0.0}
+    build:
+      context: .
+      dockerfile: mcp-servers/Dockerfile.gitlab
+    container_name: orizon-mcp-gitlab
+    env_file:
+      - .env.mcp
+    environment:
+      MCP_PORT: "${MCP_GITLAB_PORT:-8110}"
+      MCP_CRED_VARS: "ACCESS_TOKEN"
+    ports:
+      - "${MCP_GITLAB_PORT:-8110}:${MCP_GITLAB_PORT:-8110}"
+    networks:
+      - orizon-network
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import socket,os; socket.create_connection(('localhost', int(os.environ.get('MCP_PORT',8110))), timeout=5).close()"
+      interval: ${HEALTHCHECK_INTERVAL:-30s}
+      timeout: ${HEALTHCHECK_TIMEOUT:-10s}
+      start_period: 15s
+      retries: ${HEALTHCHECK_RETRIES:-3}
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 64M
+          cpus: "0.1"
+
+  mcp-central:
+    image: ${ORIZON_IMAGE_PREFIX:-scr.syneto.eu/orizon-ai/orizon-ai}/orizon-mcp-central:${ORIZON_VERSION:-v1.0.0}
+    build:
+      context: .
+      dockerfile: mcp-servers/Dockerfile.central
+    container_name: orizon-mcp-central
+    env_file:
+      - .env.mcp
+    environment:
+      MCP_PORT: "${MCP_CENTRAL_PORT:-8104}"
+      # Forward Authorization: Bearer <api_key> → API_KEY env var per request
+      MCP_CRED_VARS: "API_KEY"
+      # Sent per request as X-Mcp-CENTRAL_DOMAIN, like the two above.
+    ports:
+      - "${MCP_CENTRAL_PORT:-8104}:${MCP_CENTRAL_PORT:-8104}"
+    networks:
+      - orizon-network
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import socket,os; socket.create_connection(('localhost', int(os.environ.get('MCP_PORT',8104))), timeout=5).close()"
+      interval: ${HEALTHCHECK_INTERVAL:-30s}
+      timeout: ${HEALTHCHECK_TIMEOUT:-10s}
+      start_period: 15s
+      retries: ${HEALTHCHECK_RETRIES:-3}
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 64M
+          cpus: "0.1"
+
+  mcp-microsoft:
+    image: ${ORIZON_IMAGE_PREFIX:-scr.syneto.eu/orizon-ai/orizon-ai}/orizon-mcp-microsoft:${ORIZON_VERSION:-v1.0.0}
+    build:
+      context: .
+      dockerfile: mcp-servers/Dockerfile.microsoft
+    container_name: orizon-mcp-microsoft
+    env_file:
+      - .env.mcp
+    environment:
+      MCP_PORT: "${MCP_MICROSOFT_PORT:-8105}"
+      # Forward Authorization: Bearer <token> → ACCESS_TOKEN contextvar per request.
+      # Microsoft needs only the bearer token — no per-request X-Mcp-* extra.
+      MCP_CRED_VARS: "ACCESS_TOKEN"
+    ports:
+      - "${MCP_MICROSOFT_PORT:-8105}:${MCP_MICROSOFT_PORT:-8105}"
+    networks:
+      - orizon-network
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import socket,os; socket.create_connection(('localhost', int(os.environ.get('MCP_PORT',8105))), timeout=5).close()"
+      interval: ${HEALTHCHECK_INTERVAL:-30s}
+      timeout: ${HEALTHCHECK_TIMEOUT:-10s}
+      start_period: 15s
+      retries: ${HEALTHCHECK_RETRIES:-3}
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 64M
+          cpus: "0.1"
+
+  mcp-google:
+    image: ${ORIZON_IMAGE_PREFIX:-scr.syneto.eu/orizon-ai/orizon-ai}/orizon-mcp-google:${ORIZON_VERSION:-v1.0.0}
+    build:
+      context: .
+      dockerfile: mcp-servers/Dockerfile.google
+    container_name: orizon-mcp-google
+    env_file:
+      - .env.mcp
+    environment:
+      MCP_PORT: "${MCP_GOOGLE_PORT:-8106}"
+      # Forward Authorization: Bearer <token> → ACCESS_TOKEN contextvar per request.
+      # Google needs only the bearer token — no per-request X-Mcp-* extra.
+      MCP_CRED_VARS: "ACCESS_TOKEN"
+    ports:
+      - "${MCP_GOOGLE_PORT:-8106}:${MCP_GOOGLE_PORT:-8106}"
+    networks:
+      - orizon-network
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import socket,os; socket.create_connection(('localhost', int(os.environ.get('MCP_PORT',8106))), timeout=5).close()"
+      interval: ${HEALTHCHECK_INTERVAL:-30s}
+      timeout: ${HEALTHCHECK_TIMEOUT:-10s}
+      start_period: 15s
+      retries: ${HEALTHCHECK_RETRIES:-3}
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 64M
+          cpus: "0.1"
+
+  mcp-imap:
+    image: ${ORIZON_IMAGE_PREFIX:-scr.syneto.eu/orizon-ai/orizon-ai}/orizon-mcp-imap:${ORIZON_VERSION:-v1.0.0}
+    build:
+      context: .
+      dockerfile: mcp-servers/Dockerfile.imap
+    container_name: orizon-mcp-imap
+    env_file:
+      - .env.mcp
+    environment:
+      MCP_PORT: "${MCP_IMAP_PORT:-8111}"
+      # No bearer token: the mailbox's credentials and the server it lives on
+      # arrive per request as X-Mcp-* headers (IMAP_USER, IMAP_PASSWORD,
+      # IMAP_HOST, ...), the connection fields resolved by the backend from the
+      # admin's mail server config. A request without them is refused with 401.
+      MCP_CRED_VARS: ""
+    ports:
+      - "${MCP_IMAP_PORT:-8111}:${MCP_IMAP_PORT:-8111}"
+    networks:
+      - orizon-network
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import socket,os; socket.create_connection(('localhost', int(os.environ.get('MCP_PORT',8111))), timeout=5).close()"
+      interval: ${HEALTHCHECK_INTERVAL:-30s}
+      timeout: ${HEALTHCHECK_TIMEOUT:-10s}
+      start_period: 15s
+      retries: ${HEALTHCHECK_RETRIES:-3}
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 64M
+          cpus: "0.1"
+
+  mcp-okasa:
+    profiles: ["okasa", "external"]
+    image: ${ORIZON_IMAGE_PREFIX:-scr.syneto.eu/orizon-ai/orizon-ai}/orizon-mcp-okasa:${ORIZON_VERSION:-v1.0.0}
+    build:
+      context: .
+      dockerfile: mcp-servers/Dockerfile.okasa
+    container_name: orizon-mcp-okasa
+    environment:
+      MCP_PORT: "8300"
+      MCP_ALLOWED_HOSTS: "mcp-okasa:8300,localhost:8300"
+    networks:
+      - orizon-network
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import socket; socket.create_connection(('localhost', 8300), timeout=5).close()"
+      interval: ${HEALTHCHECK_INTERVAL:-30s}
+      timeout: ${HEALTHCHECK_TIMEOUT:-10s}
+      start_period: 15s
+      retries: ${HEALTHCHECK_RETRIES:-3}
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 64M
+          cpus: "0.1"
+
+  # ---------------------------------------------------------------------------
+  # Code sandbox — Python execution for the chat model
+  #
+  # Three services, and the split between them IS the security boundary:
+  #
+  #   sandbox-dind     the Docker daemon that runs untrusted code. Rootless, and
+  #                    deliberately NOT the host daemon.
+  #   sandbox-image-loader  one-shot; pre-pulls the runtime image into that
+  #                    daemon's private image store at boot.
+  #   mcp-sandbox      the MCP control plane the backend talks to.
+  #
+  # Why a separate daemon at all: llm-sandbox creates containers by talking to a
+  # Docker socket. Mounting the *host* socket into a service that executes
+  # model-authored code would hand that code root-equivalent control of the host
+  # — every container, volume and image on the box, including the database. The
+  # backend already enforces no auth of its own (docs/SECURITY_NOTES.md §1), so
+  # anything reaching it would inherit that. A dedicated rootless daemon means an
+  # escape lands in a user-namespaced sidecar holding nothing of value.
+  # ---------------------------------------------------------------------------
+  sandbox-dind:
+    # -rootless is load-bearing, not a preference. Untrusted code runs as root
+    # *inside* its container (llm-sandbox copies the snippet in as a root-owned
+    # 0600 file, so a non-root container user cannot read it). Under a rootless
+    # daemon that container-root maps through a user namespace to an
+    # unprivileged host uid. Switching this to plain `docker:27-dind` silently
+    # turns container-root into host-root and voids the whole design.
+    image: docker:27-dind-rootless
+    container_name: orizon-sandbox-dind
+    # Required even for the rootless variant: the daemon needs to set up its own
+    # user namespaces and mounts. The privilege stays with this sidecar, which
+    # holds no project data — not with the backend.
+    privileged: true
+    #
+    # UBUNTU 23.10+ HOSTS NEED ONE HOST-SIDE STEP, or this container restart-loops
+    # on "[rootlesskit:parent] error: failed to start the child: fork/exec
+    # /proc/self/exe: operation not permitted".
+    #
+    # Those releases set kernel.apparmor_restrict_unprivileged_userns=1, which
+    # transitions anything asking for an unprivileged user namespace into a profile
+    # that denies CAP_SYS_ADMIN — the capability RootlessKit needs to create the
+    # namespace in the first place. The host kernel decides that from the binary's
+    # path, so `privileged: true` does not exempt it and neither does any
+    # `security_opt:` here; all three were tried and fail identically. Install the
+    # profile in apparmor/rootlesskit, which grants that one binary that one
+    # permission and leaves the restriction in force for the rest of the machine:
+    #
+    #   sudo cp apparmor/rootlesskit /etc/apparmor.d/rootlesskit
+    #   sudo apparmor_parser -r /etc/apparmor.d/rootlesskit
+    #
+    # Switching to rootful `docker:27-dind` also makes the error go away and is the
+    # wrong fix: see the note below on what that costs.
+    #
+    # KNOWN LIMITATION — cgroup limits are silently dropped here.
+    # A rootless daemon only gets cgroup control when systemd delegates it. In
+    # this container it does not, so `docker info` reports "Cgroup Driver: none"
+    # and per-container --memory / --pids-limit are ACCEPTED AND IGNORED. Verified
+    # by starting a container through this sidecar with --memory=64m
+    # --pids-limit=32: memory.max and pids.max both read "max".
+    #
+    # This is why sandbox.py enforces memory, CPU-time, process count and file
+    # size with rlimits (data/cpu/nproc/fsize) instead, which the kernel applies
+    # per-process with no cgroup involvement, and which code running as a
+    # non-root uid cannot raise. Check the mode on a given host with:
+    #   docker compose -f docker-compose.mcp.yml exec sandbox-dind \
+    #     docker -H tcp://localhost:2375 info | grep -i cgroup
+    #
+    # If you would rather have cgroup enforcement than user-namespace isolation,
+    # switch the image above to `docker:27-dind` (rootful). That makes the
+    # per-container memory/pids limits real, but it also makes container-root
+    # equal to host-root through this privileged sidecar. The rootless default
+    # trades DoS resistance (bounded by the 4G cap below) for escape resistance,
+    # which is the more severe of the two failure modes.
+    environment:
+      # Plaintext TCP is acceptable because 2375 is never published to the host
+      # and orizon-sandbox-network carries only this daemon and mcp-sandbox.
+      # Anything that can reach this port can create containers on this daemon,
+      # so do not add a `ports:` mapping here and do not attach other services.
+      DOCKER_TLS_CERTDIR: ""
+    command:
+      - "--host=tcp://0.0.0.0:2375"
+      # Cap what the daemon will ever hand out, independent of what the MCP
+      # server asks for, so a bug there cannot exhaust the host. These are
+      # rlimits rather than cgroup limits on purpose — see the note below.
+      - "--default-ulimit=nproc=256:256"
+      - "--default-ulimit=nofile=1024:1024"
+      - "--default-ulimit=fsize=268435456:268435456"
+    volumes:
+      # Rootless dind stores images/layers under the rootless user's home, not
+      # /var/lib/docker. A named volume keeps the pulled runtime image across
+      # restarts so the loader below is a no-op after first boot.
+      - orizon_sandbox_dind:/home/rootless/.local/share/docker
+    networks:
+      - orizon-sandbox-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "docker", "-H", "tcp://localhost:2375", "info"]
+      interval: ${HEALTHCHECK_INTERVAL:-30s}
+      timeout: ${HEALTHCHECK_TIMEOUT:-10s}
+      start_period: 40s
+      retries: ${HEALTHCHECK_RETRIES:-5}
+    deploy:
+      resources:
+        limits:
+          # This cap IS enforced — it is applied by the *host* daemon, which has
+          # cgroups, unlike the nested limits described above. It is the hard
+          # ceiling on total sandbox damage: the worst case is that sandboxed
+          # work OOMs this sidecar, which then restarts.
+          # Must exceed the memory cap times the concurrency cap (both under
+          # Connectors > Code sandbox) plus daemon overhead, or ordinary concurrent
+          # executions will trip it. Those two are editable and this is not, so the
+          # panel says on both of them what they have to stay under.
+          memory: 4G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
+          cpus: "0.25"
+
+  sandbox-image-loader:
+    # The dind daemon has its own image store — the host's images are invisible
+    # to it. Without this, the first run_python call triggers an implicit ~1GB
+    # pull inside the request and appears to the user as a hang, then a timeout.
+    #
+    # This service owns the runtime image end to end: it pulls it when the tag is
+    # publishable, and otherwise builds it directly inside the sandbox daemon.
+    # Editing SANDBOX_PACKAGES or the Dockerfile and running `docker compose -f
+    # docker-compose.mcp.yml up -d` is therefore the entire procedure for adding a
+    # library or a font. Nothing has to be built on the host and nothing has to be
+    # side-loaded, which is what made the old flow drift: SANDBOX_IMAGE is
+    # `:local` by default, so its `docker pull` could never succeed, and the
+    # "already present" branch then kept a stale image forever while the panel
+    # allowlist advertised packages that image did not hold.
+    #
+    # It re-runs on every `up -d` and costs nothing when nothing changed: it
+    # compares two labels and exits. SANDBOX_IMAGE_REBUILD=true, passed here or
+    # through `run --rm -e`, rebuilds from scratch instead.
+    #
+    # Both names come from .env.mcp through env_file below, NOT through ${...}:
+    # compose interpolation resolves only against the root .env, so they would
+    # come back empty here. That is also why this builds rather than letting
+    # compose do it — a build.args entry would need the interpolation that does
+    # not work for this file.
+    image: docker:27-cli
+    container_name: orizon-sandbox-image-loader
+    depends_on:
+      sandbox-dind:
+        condition: service_healthy
+    env_file:
+      - .env.mcp
+    environment:
+      DOCKER_HOST: tcp://sandbox-dind:2375
+    volumes:
+      # The script, and the build context it hands the daemon: the Dockerfile
+      # alone, so the upload is a few KB.
+      #
+      # The helper package generated scripts imported, and the API digest of the
+      # document libraries, are both gone with the code generation. Documents are
+      # rendered in the backend now and no document job reaches this container.
+      - ./mcp-servers/ensure-sandbox-image.sh:/ensure-sandbox-image.sh:ro
+      - ./mcp-servers/Dockerfile.sandbox-runtime:/build/Dockerfile:ro
+    entrypoint: ["sh", "/ensure-sandbox-image.sh"]
+    networks:
+      - orizon-sandbox-network
+    restart: "no"
+
+  mcp-sandbox:
+    image: ${ORIZON_IMAGE_PREFIX:-scr.syneto.eu/orizon-ai/orizon-ai}/orizon-mcp-sandbox:${ORIZON_VERSION:-v1.0.0}
+    build:
+      context: .
+      dockerfile: mcp-servers/Dockerfile.sandbox
+    container_name: orizon-mcp-sandbox
+    env_file:
+      - .env.mcp
+    environment:
+      MCP_PORT: "${MCP_SANDBOX_PORT:-8107}"
+      # auth="none" connector — brokers a local daemon, not a per-user API, so
+      # there is no Bearer token to forward. The backend still sends this
+      # container's execution policy per request as X-Mcp-* headers, which is why
+      # run_mcp_http.py reads those headers whether or not a token is expected.
+      MCP_CRED_VARS: ""
+      # Points at the sidecar. Never set this to the host socket.
+      DOCKER_HOST: tcp://sandbox-dind:2375
+    # No volumes. This container used to mount the doc-assets volume read-only,
+    # so a document job could hand `run_python` a path to its logo and to the
+    # file being edited. Documents are rendered in the backend and nothing is
+    # placed in a sandbox container any more: a snippet reads only itself.
+    ports:
+      - "${MCP_SANDBOX_PORT:-8107}:${MCP_SANDBOX_PORT:-8107}"
+    depends_on:
+      sandbox-dind:
+        condition: service_healthy
+    networks:
+      # Two networks by design: orizon-network so the backend can call it,
+      # orizon-sandbox-network to reach the daemon. sandbox-dind is NOT on
+      # orizon-network, so sandboxed code — even with runtime installs enabled
+      # and a network — has no route to the database or the backend.
+      - orizon-network
+      - orizon-sandbox-network
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import socket,os; socket.create_connection(('localhost', int(os.environ.get('MCP_PORT',8107))), timeout=5).close()"
+      interval: ${HEALTHCHECK_INTERVAL:-30s}
+      timeout: ${HEALTHCHECK_TIMEOUT:-10s}
+      start_period: 15s
+      retries: ${HEALTHCHECK_RETRIES:-3}
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 64M
+          cpus: "0.1"
+
+  # ── Template: copy-paste this block to add the next MCP server ───────
+  #
+  # mcp-<slug>:
+  #   image: ${ORIZON_IMAGE_PREFIX:-scr.syneto.eu/orizon-ai/orizon-ai}/orizon-mcp-<slug>:${ORIZON_VERSION:-v1.0.0}
+  #   build:
+  #     context: .
+  #     dockerfile: mcp-servers/Dockerfile.<slug>
+  #   container_name: orizon-mcp-<slug>
+  #   env_file:
+  #     - .env.mcp
+  #   environment:
+  #     MCP_PORT: "<NEXT_PORT>"         # 8101, 8102, …
+  #     MCP_CRED_VARS: ""               # e.g. "ACCESS_TOKEN" if auth needed
+  #   networks:
+  #     - orizon-network
+  #   restart: unless-stopped
+  #   healthcheck:
+  #     test:
+  #       - "CMD"
+  #       - "python3"
+  #       - "-c"
+  #       - "import socket; socket.create_connection(('localhost', <NEXT_PORT>), timeout=5).close()"
+  #     interval: ${HEALTHCHECK_INTERVAL:-30s}
+  #     timeout: ${HEALTHCHECK_TIMEOUT:-10s}
+  #     start_period: 15s
+  #     retries: ${HEALTHCHECK_RETRIES:-3}
+
+networks:
+  orizon-network:
+    external: true
+    name: orizon-network
+
+  # Carries only sandbox-dind and mcp-sandbox. Its purpose is to keep the
+  # sandbox daemon OFF orizon-network: containers it spawns therefore have no
+  # route to the database, the backend or the other MCP servers.
+  #
+  # Not marked `internal: true` on purpose — sandbox-image-loader has to pull the
+  # ~1GB runtime image from the registry at first boot, and runtime installs
+  # (SANDBOX_ALLOW_RUNTIME_INSTALL=true) need to reach an index. The residual
+  # exposure is narrow: with the default SANDBOX_ALLOW_RUNTIME_INSTALL=false,
+  # executed code gets network_mode=none and has no connectivity of any kind.
+  # If you want egress closed off completely, set internal: true and side-load
+  # the image instead:
+  #   docker save "$SANDBOX_IMAGE" | docker -H tcp://sandbox-dind:2375 load
+  orizon-sandbox-network:
+    driver: bridge
+
+volumes:
+  # Image store for the rootless sandbox daemon. Persisting it means the runtime
+  # image is pulled once rather than on every restart.
+  orizon_sandbox_dind:

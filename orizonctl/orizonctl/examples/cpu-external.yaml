@@ -1,0 +1,46 @@
+# No GPU: every model comes from an OpenAI-compatible endpoint elsewhere, plain
+# HTTP via nginx on port 80 (LAN or evaluation). Only db, backend, frontend and
+# nginx run; no model server.
+#
+#   curl -fsSL https://raw.githubusercontent.com/Orizon-eu/orizon-ai-deploy/main/install.sh \
+#     | sudo bash -s -- --config /root/orizon.yaml
+
+install:
+  version: v1.3.0
+  skip_nvidia: true
+
+configure:
+  version: v1.3.0
+
+  registry:
+    prefix: scr.syneto.eu/orizon-ai/orizon-ai
+    username: "robot$orizon-ai-scr"
+    token: "CHANGE-ME"
+
+  models:
+    text: external
+    embedding: external
+    rerank: off
+
+  external:
+    text:
+      url: https://api.openai.com        # no trailing /v1
+      model: gpt-4o
+      api_key: "CHANGE-ME"               # or leave empty and set it in Settings > System > Credentials
+    embedding:
+      url: https://api.openai.com
+      model: text-embedding-3-small
+      api_key: "CHANGE-ME"
+
+  access:
+    mode: direct
+    public_url: http://10.0.0.5          # the address users open; cookies are bound to this origin
+
+  mcp: false
+
+  # Without a GPU nothing here serves a model, so the weights are not fetched.
+  # Set true to download the shipped defaults (~42 GB) under models_path anyway,
+  # ready for a GPU added later. The gated pyannote model needs hf_token.
+  download_models: false
+  # models_path: /srv/orizon-models
+  # hf_token: "CHANGE-ME"

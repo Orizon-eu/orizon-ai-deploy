@@ -1,0 +1,142 @@
+# Every key the installer and the wizard read, with its default. Copy, delete
+# what you do not need, fill in the rest.
+#
+#   curl -fsSL https://raw.githubusercontent.com/Orizon-eu/orizon-ai-deploy/main/install.sh \
+#     | sudo bash -s -- --config /root/orizon.yaml
+#
+#   sudo orizonctl config check /root/orizon.yaml                     # typos, what will be read
+#   sudo orizonctl setup --non-interactive --config /root/orizon.yaml # on an installed host
+#   sudo orizonctl configure --config /root/orizon.yaml               # re-configure; answered
+#                                                                     # questions are not asked
+#
+# Two sections. `install:` is read by install.sh only; `configure:` answers the
+# wizard's questions and is what orizonctl reads. A key left out falls back to
+# the value already in the host's env files, then to the default below; a
+# required value with no default (the domain in letsencrypt mode, an external
+# URL) is an error, never a guess. Secrets left out are generated on the first
+# run and kept on every later one. The file holds credentials: keep it 0600.
+#
+# The same keys work as JSON, and the older bare answers file (no `install:` /
+# `configure:` sections, just the keys of `configure:` at the top level) is
+# still accepted.
+
+install:
+  home: /opt/orizon            # install root: app files, venv, backups (ORIZON_HOME)
+  version: latest              # release to install, e.g. v1.2.0; `latest` = the deploy project's main branch
+  cli_source: ""               # pip spec template for the CLI; empty = the public deploy project.
+                               # {version} and {pyversion} are substituted; a local path works too.
+  install_only: false          # true: install Docker, the toolkit and orizonctl, print a preflight, stop
+  interactive: false           # true: run the wizard on the terminal, this file pre-fills it;
+                               # false: unattended `orizonctl setup --non-interactive`
+  no_pull: false               # true: do not pull images at the end of setup (`setup --no-pull`)
+  skip_docker: false           # true: never install Docker (fail when it is missing)
+  skip_nvidia: false           # true: never touch the NVIDIA container toolkit
+
+configure:
+  version: v1.3.0              # image tag to deploy (ORIZON_VERSION); every service is pulled at this tag
+
+  registry:
+    prefix: scr.syneto.eu/orizon-ai/orizon-ai   # registry host + project path, no trailing slash;
+                                                # images are pulled as <prefix>/orizon-ai-backend:<version>
+    login: true                # run `docker login <host>`; unattended runs log in only when this is
+                               # true or a username is given. The credential goes to
+                               # /root/.docker/config.json, never into an env file.
+    username: "robot$orizon-ai-scr"   # Harbor robot account (pull on the project), GitLab deploy
+    token: ""                          # token (read_registry) or a Docker Hub access token
+
+  models:
+    text: local                # local (bundled vLLM on this host's GPU) | external
+    text_model: Qwen/Qwen3.6-35B-A3B-FP8        # HuggingFace id; weights under <models_path>/<basename>
+    embedding: local           # local | external
+    embedding_model: nomic-ai/nomic-embed-text-v2-moe   # changing it later invalidates every stored index
+    rerank: local              # local | external | off
+    rerank_model: Qwen/Qwen3-Reranker-0.6B
+    transcription: false       # Orizon Transcribe: Qwen3-ASR plus a pyannote diarization server; needs a GPU
+    transcription_model: Qwen/Qwen3-ASR-1.7B
+
+  external:                    # only read for a role set to `external` above
+    text:
+      url: https://api.openai.com      # base URL, no trailing /v1 (the backend appends it)
+      model: gpt-4o                    # the model name the endpoint expects
+      api_key: ""                      # empty: set it later in Settings > System > Credentials
+    embedding:
+      url: http://emb.internal:8000
+      model: nomic-ai/nomic-embed-text-v2-moe   # same key as models.embedding_model; either works
+      api_key: ""
+    rerank:
+      url: http://rerank.internal:8000
+      model: Qwen/Qwen3-Reranker-0.6B
+      api_key: ""
+
+  models_path: /srv/orizon-models    # directory on this host holding the weights (created if missing)
+
+  gpu:                         # only read when a model is served locally
+    tensor_parallel: 1         # GPUs the text server spans (1..number of cards)
+    max_model_len: 262144      # text server context length; lower it on a 24 GiB card (32768)
+    embedding_device: "0"      # GPU index per secondary server (multi-GPU hosts)
+    rerank_device: "0"
+    transcription_device: "0"
+    diarization_device: "0"    # the diarization server sits outside the fractions below
+    fractions:                 # GPU memory fraction per server; must sum to < 1 per card.
+      text: 0.50               # Left out: the defaults, rescaled to 0.90 when they do not fit.
+      embedding: 0.10
+      rerank: 0.12
+      transcription: 0.40
+
+  access:
+    mode: letsencrypt          # letsencrypt | custom-cert | external-proxy | direct | direct-no-nginx
+    # letsencrypt: HTTPS via nginx, certificate from Let's Encrypt over Cloudflare DNS-01
+    domain: ai.example.com     # the A record pointing at this server (letsencrypt, custom-cert)
+    email: ops@example.com     # Let's Encrypt expiry notices
+    cloudflare_token: ""       # Cloudflare API token with Zone > DNS > Edit on this zone
+    staging: true              # Let's Encrypt STAGING first (untrusted test cert, no rate limits);
+                               # set false and run `orizonctl ssl issue` once the flow works
+    # custom-cert: HTTPS via nginx with your own certificate
+    cert_dir: ./certs          # holds fullchain.pem + privkey.pem; relative to the app directory
+    # external-proxy (your TLS terminator forwards to nginx on port 80) and direct (plain HTTP via nginx):
+    public_url: https://ai.example.com   # what users open; session cookies are bound to this origin.
+                                         # direct mode default: http://<host ip>
+                                         # direct-no-nginx (rare): no nginx, users open http://<host ip>:<frontend port>;
+                                         # /v1, /public and webhooks are then only reachable from this host
+
+  ports:                       # leave the section out to keep every default
+    frontend: 3000             # published on all interfaces
+    backend: 8005              # published on loopback only
+    postgres: 55432            # published on all interfaces; firewall it
+    vllm: 8001                 # text server (local text only)
+    embedding_vllm: 8006
+    rerank_vllm: 8004
+    transcription_vllm: 8002
+    diarization: 8008
+
+  database:
+    password: ""               # empty: generated on the first run, kept afterwards
+
+  secrets:                     # empty: generated once, kept on every later run
+    better_auth_secret: ""     # signs session cookies (64 hex chars)
+    internal_api_key: ""       # gates the backend API (64 hex chars)
+    master_key: ""             # ORIZON_MCP_ENCRYPTION_KEY, base64 of 32 bytes; encrypts every stored
+                               # credential. NEVER rotate it here; use scripts/rotate_encryption_key.py.
+    webhook_api_key: ""        # bearer token for api/instance/status
+
+  mcp: false                   # the MCP connector stack (HubSpot, Freshdesk, Salesforce, Microsoft,
+                               # Google, code sandbox); adds docker-compose.mcp.yml
+  mcp_profiles: []             # compose profiles of servers only some deployments run, e.g. [okasa],
+                               # or [external] for all of them; each is then attached in Settings >
+                               # External MCP. Omitted: what this host already runs is kept.
+                               # Only read when mcp is true
+  smb_mount_dir: /mnt/orizon   # bind mount the backend uses for SMB sources; move it on a host
+                               # where /mnt is read-only
+
+  transcription:               # only read when models.transcription is true
+    hf_token: ""               # pyannote diarization is a gated model
+    telegram: false            # also run the Telegram bot; the Transcriptions page works without it
+    bot_token: ""              # from @BotFather (telegram: true only)
+    api_id: ""                 # my.telegram.org
+    api_hash: ""
+
+  telegram_bot_username: ""    # the bot users link their Telegram account to (telegram: true only)
+
+  hf_token: ""                 # HuggingFace token for the model download (gated or private models)
+  download_models: true        # download the selected models during setup (skipped for weights
+                               # already under models_path); also: orizonctl models download

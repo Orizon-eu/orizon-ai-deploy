@@ -1,0 +1,25 @@
+# OrizonAI nginx — plain HTTP on port 80
+#
+# For localhost, a LAN IP, a proxy/WAF in front that terminates TLS itself, or
+# the first run of the Let's Encrypt mode before a certificate exists.
+# Answers on any Host (IP, localhost or a name), so NGINX_DOMAIN is not used.
+#
+# Substituted at container start from .env.nginx:
+#   SERVER_PORT  — the backend's port on orizon-network
+# Routes and proxy settings live in nginx/orizon/, shared with the HTTPS templates.
+
+include /etc/nginx/orizon/http.conf;
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    # Resolve per request, so a recreated container's new IP is picked up
+    # without restarting nginx, and nginx starts even if one is still down.
+    resolver ${NGINX_LOCAL_RESOLVERS} valid=10s;
+    set $orizon_frontend http://frontend:3000;
+    set $orizon_backend  http://backend:${SERVER_PORT};
+
+    include /etc/nginx/orizon/routes.conf;
+}

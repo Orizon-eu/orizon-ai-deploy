@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orizonctl"
+version = "1.3.0"
+description = "Orizon AI production deployment CLI: preflight, configuration, stack control"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+dependencies = [
+  "click>=8.1",
+  "huggingface_hub>=0.24",
+  "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+orizonctl = "orizonctl.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["orizonctl*"]
+
+# The deployment files a host needs (compose, env templates, nginx templates,
+# helper scripts), copied in by sync-assets.sh (see orizonctl/assets.py), and
+# the example config files printed by `orizonctl config example`.
+[tool.setuptools.package-data]
+orizonctl = ["assets/MANIFEST", "assets/*", "assets/**/*", "examples/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

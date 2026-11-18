@@ -1,0 +1,47 @@
+# OrizonAI nginx — HTTPS with a certificate you provide
+#
+# A company-issued certificate, a purchased one, one from an internal CA, or a
+# self-signed one for a LAN IP. Mount the directory holding it via SSL_CERT_DIR
+# in .env (default ./certs), with these filenames:
+#   fullchain.pem  — certificate followed by any intermediates
+#   privkey.pem    — private key
+#
+# Substituted at container start from .env.nginx:
+#   NGINX_DOMAIN — the name the certificate was issued for
+#   SERVER_PORT  — the backend's port on orizon-network
+# Other hostnames and IPs are served too (default_server), with the same cert.
+# Routes and proxy settings live in nginx/orizon/, shared with the other templates.
+
+include /etc/nginx/orizon/http.conf;
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name ${NGINX_DOMAIN};
+
+    resolver ${NGINX_LOCAL_RESOLVERS} valid=10s;
+    set $orizon_frontend http://frontend:3000;
+    set $orizon_backend  http://backend:${SERVER_PORT};
+
+    if ($orizon_redirect_to_https) {
+        return 301 https://$host:${NGINX_HTTPS_PORT}$request_uri;
+    }
+
+    include /etc/nginx/orizon/routes.conf;
+}
+
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name ${NGINX_DOMAIN};
+
+    ssl_certificate     /etc/ssl/custom/fullchain.pem;
+    ssl_certificate_key /etc/ssl/custom/privkey.pem;
+    include /etc/nginx/orizon/tls.conf;
+
+    resolver ${NGINX_LOCAL_RESOLVERS} valid=10s;
+    set $orizon_frontend http://frontend:3000;
+    set $orizon_backend  http://backend:${SERVER_PORT};
+
+    include /etc/nginx/orizon/routes.conf;
+}

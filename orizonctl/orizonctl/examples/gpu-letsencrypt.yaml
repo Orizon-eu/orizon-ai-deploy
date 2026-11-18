@@ -1,0 +1,43 @@
+# Full stack on one GPU host: local text, embedding and rerank servers, HTTPS
+# via nginx with a Let's Encrypt certificate (Cloudflare DNS-01), connectors on.
+#
+#   curl -fsSL https://raw.githubusercontent.com/Orizon-eu/orizon-ai-deploy/main/install.sh \
+#     | sudo bash -s -- --config /root/orizon.yaml
+#
+# Fill in the three tokens. Everything not listed keeps its default; see
+# `orizonctl config example reference` for every key.
+
+install:
+  version: v1.3.0
+  interactive: false           # unattended; true runs the wizard with these answers pre-filled
+
+configure:
+  version: v1.3.0
+
+  registry:
+    prefix: scr.syneto.eu/orizon-ai/orizon-ai
+    username: "robot$orizon-ai-scr"
+    token: "CHANGE-ME"
+
+  models:
+    text: local
+    embedding: local
+    rerank: local
+    transcription: false
+  models_path: /srv/orizon-models
+
+  gpu:
+    tensor_parallel: 1
+    max_model_len: 65536       # 262144 needs an 80 GiB card; 32768 for 24 GiB
+
+  access:
+    mode: letsencrypt
+    domain: ai.example.com
+    email: ops@example.com
+    cloudflare_token: "CHANGE-ME"
+    staging: true              # switch to false, then `orizonctl ssl issue`, once the flow works
+
+  mcp: true
+
+  hf_token: ""                 # only for gated or private models
+  download_models: true

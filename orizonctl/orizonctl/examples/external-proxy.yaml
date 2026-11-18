@@ -1,0 +1,37 @@
+# Behind your own reverse proxy or TLS terminator (Traefik, HAProxy, a
+# corporate nginx): the bundled nginx serves plain HTTP on port 80, the proxy
+# terminates TLS and forwards to it with X-Forwarded-Proto. Local models on
+# one GPU.
+#
+#   curl -fsSL https://raw.githubusercontent.com/Orizon-eu/orizon-ai-deploy/main/install.sh \
+#     | sudo bash -s -- --config /root/orizon.yaml
+
+install:
+  version: v1.3.0
+
+configure:
+  version: v1.3.0
+
+  registry:
+    prefix: scr.syneto.eu/orizon-ai/orizon-ai
+    username: "robot$orizon-ai-scr"
+    token: "CHANGE-ME"
+
+  models:
+    text: local
+    embedding: local
+    rerank: local
+  models_path: /srv/orizon-models
+  gpu:
+    max_model_len: 65536
+
+  access:
+    mode: external-proxy
+    public_url: https://ai.corp.example   # what the proxy serves; it forwards to this host:80
+
+  ports:
+    frontend: 3000
+    backend: 8005
+
+  mcp: false
+  download_models: true

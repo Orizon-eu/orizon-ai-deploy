@@ -1,0 +1,213 @@
+# =============================================================================
+# Sandbox runtime image — the throwaway container that untrusted Python runs in
+#
+# This image is NOT a service. mcp-sandbox spawns one container from it per
+# code execution and destroys it afterwards. It is built once and referenced by
+# SANDBOX_IMAGE.
+#
+# Why pre-bake the package set instead of pip-installing per run:
+#   `pip install` needs network access, and the whole point of this container is
+#   that it has none (network_mode=none). Baking the common scientific stack in
+#   means the overwhelming majority of generated snippets run with the network
+#   off and with zero install latency. Runtime installation still exists as an
+#   opt-in escape hatch (SANDBOX_ALLOW_RUNTIME_INSTALL=true), which turns the
+#   network back on — see mcp-servers/sandbox-mcp-server/sandbox.py.
+#
+# Nothing has to build this by hand. sandbox-image-loader builds it inside the
+# sandbox daemon on `docker compose -f docker-compose.mcp.yml up -d`, passing the
+# SANDBOX_PACKAGES it reads from `.env.mcp`, and rebuilds it whenever that line
+# OR THIS FILE changes: both are labels on the image and both are compared. So
+# editing either one is the whole procedure, and a change here that pip cannot
+# see, such as the font packages below, is not invisible to the check.
+#
+# Building it here by hand is for one case only: publishing a registry image so
+# deployments pull instead of build. Pass the recipe hash too, or the published
+# image carries no record of what it was built from and the loader can only warn
+# about half of it.
+# The context is a STAGED DIRECTORY rather than the repo, because the loader
+# mounts a flat /build and the two have to agree or the loader's image and a
+# hand-built one differ in what they contain. Assemble the same thing it mounts,
+# and hash the whole directory, which is what the loader compares against the
+# label.
+#   set -a; . ./.env.mcp; set +a
+#   rm -rf /tmp/sandbox-ctx && mkdir -p /tmp/sandbox-ctx
+#   cp mcp-servers/Dockerfile.sandbox-runtime /tmp/sandbox-ctx/Dockerfile
+#   docker build -f /tmp/sandbox-ctx/Dockerfile \
+#     --build-arg SANDBOX_PACKAGES="$SANDBOX_PACKAGES" \
+#     --build-arg SANDBOX_RECIPE="$(find /tmp/sandbox-ctx -type f | LC_ALL=C sort \
+#         | xargs sha256sum | sha256sum | cut -c1-16)" \
+#     -t "$SANDBOX_IMAGE" /tmp/sandbox-ctx
+#
+# SANDBOX_PACKAGES is one list in `.env.mcp` serving two ends. Here it decides what
+# pip installs. Given to the mcp-sandbox container, it becomes the allowlist of
+# names run_python may be asked for whenever the panel's own
+# SANDBOX_ALLOWED_LIBRARIES is empty, so extending the set is a single edit
+# rather than two lists to keep in step.
+#
+# There is deliberately no default list below. `.env.mcp` is the only place the
+# set is written down, and a build with no --build-arg fails loudly rather than
+# quietly producing an image whose contents disagree with the allowlist the
+# model is handed. That disagreement is invisible from the outside: the model is
+# told python-docx is available, the import fails, and nothing in the stack
+# reports which of the two is wrong. The label at the bottom of the pip step is
+# what lets the loader detect it.
+# =============================================================================
+FROM python:3.11-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# matplotlib must never try to reach a display; Agg writes straight to file.
+ENV MPLBACKEND=Agg
+
+# Single-threaded BLAS/OpenMP. Two reasons, the second one non-obvious:
+#   1. The sandbox is capped at ~1 CPU, so extra threads only add contention.
+#   2. OpenBLAS sizes its per-thread scratch buffers from the *host's* core count
+#      at import time. On a many-core machine that allocation is hundreds of MB
+#      and blows the memory rlimit before user code runs — `import numpy` dies
+#      with "OpenBLAS error: Memory allocation still failed after 10 retries".
+#      Pinning to 1 thread keeps numpy importable under a 512m cap.
+ENV OPENBLAS_NUM_THREADS=1
+ENV OMP_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
+ENV NUMEXPR_NUM_THREADS=1
+
+# libgomp1: OpenMP runtime that scikit-learn / scipy wheels link against.
+#
+# The font packages are here for `run_python` itself, not for documents. A
+# generated document is rendered in the backend now, which carries its own copy of
+# these same packages; what is left in this image is a chat user asking the sandbox
+# for a PDF, and reportlab opens a real font file and knows only the base 14, so
+# without them `fontName="Calibri"` raises `KeyError: 'Calibri'`.
+#
+# Chosen for metric compatibility, so a PDF and the Word version of the same
+# document lay out the same and a desktop that has the real face substitutes
+# cleanly:
+#   fonts-crosextra-carlito  Carlito   ↔ Calibri
+#   fonts-crosextra-caladea  Caladea   ↔ Cambria
+#   fonts-liberation         Liberation Sans/Serif/Mono ↔ Arial / Times New
+#                            Roman / Courier New
+#   fonts-dejavu-core        DejaVu Sans/Serif/Sans Mono, the full-Unicode
+#                            fallback: the base 14 are Latin-1 only and render
+#                            anything outside it as black squares
+#   fonts-dejavu-extra       the italic and oblique faces of those three, which
+#                            core does not ship
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libgomp1 \
+      fonts-crosextra-carlito \
+      fonts-crosextra-caladea \
+      fonts-liberation \
+      fonts-dejavu-core \
+      fonts-dejavu-extra \
+    && rm -rf /var/lib/apt/lists/*
+
+# Default set, covering typical data-analysis and math snippets plus the
+# document formats a generated report tends to be asked for.
+# Deliberately excludes anything network-shaped (requests, httpx, urllib3 extras)
+# — with network_mode=none they cannot work, and their presence only invites the
+# model to write code that hangs.
+#
+# Commas or whitespace both separate, so the one comma-separated `.env` line can
+# be passed straight in. Entries are pip requirements, pinned with `==` so that
+# the label below records the versions and not only the names; mcp-sandbox cuts
+# each one at its specifier for the allowlist, which is checked against bare
+# distribution names. Several import as something else (python-docx as docx,
+# python-pptx as pptx, scikit-learn as sklearn, pymupdf as pymupdf with the old
+# fitz alias now deprecated).
+ARG SANDBOX_PACKAGES=""
+RUN set -e; \
+    if [ -z "$(echo "${SANDBOX_PACKAGES}" | tr -d '[:space:]')" ]; then \
+      echo "SANDBOX_PACKAGES is empty. Pass it from .env.mcp:" >&2; \
+      echo "  --build-arg SANDBOX_PACKAGES=\"\$SANDBOX_PACKAGES\"" >&2; \
+      exit 1; \
+    fi; \
+    pip install --no-cache-dir $(echo "${SANDBOX_PACKAGES}" | tr ',' ' ')
+
+# What this image was built from, verbatim. sandbox-image-loader compares it
+# against the current SANDBOX_PACKAGES and rebuilds when they have drifted apart.
+# Without it the loader can only ask "is anything tagged SANDBOX_IMAGE present",
+# which a stale image built from an older list answers yes to.
+LABEL orizon.sandbox.packages="${SANDBOX_PACKAGES}"
+
+# No USER directive and no fixed uid on purpose. sandbox.py runs this image as
+# whatever uid the MCP server process itself has, because llm-sandbox copies the
+# snippet in as a 0600 file owned by that uid — see the note in
+# sandbox-mcp-server/sandbox.py::build_runtime_configs. That uid is therefore not
+# known at build time and has no /etc/passwd entry at runtime.
+#
+# Both directories consequently need to be writable by an arbitrary uid, so they
+# get /tmp-style permissions: world-writable with the sticky bit, which allows
+# writes without letting one execution delete another's files. Every container is
+# destroyed after a single call regardless.
+#
+# The container runs as a uid with no /etc/passwd entry, so HOME defaults to "/"
+# and anything that wants a config or cache directory fails. matplotlib is the
+# loud one: it prints "mkdir -p failed for path /.config/matplotlib" plus a
+# temporary-cache warning to stderr on every single import, which would show up
+# in the model's tool result as if something had gone wrong. Point both at
+# writable locations instead.
+ENV HOME=/tmp
+ENV MPLCONFIGDIR=/tmp/matplotlib
+ENV XDG_CACHE_HOME=/tmp/cache
+
+# /sandbox is the workdir; /tmp/venv is where llm-sandbox builds its venv when
+# runtime installs are enabled.
+RUN mkdir -p /sandbox /tmp/venv /tmp/matplotlib /tmp/cache \
+    && chmod 1777 /sandbox /tmp/venv /tmp/matplotlib /tmp/cache
+
+WORKDIR /sandbox
+
+# Record what was actually baked in, so `sandbox_list_packages` can report
+# ground truth rather than echoing back the configured allowlist.
+RUN pip freeze > /opt/sandbox-packages.txt
+
+# What the image used to carry besides the packages, and why neither is here now.
+# An API digest of the document libraries, computed at build time, told a
+# generated script what `reportlab.lib.units` really exports; a helper package
+# held the recipes that script had to write out in full. Both served code
+# generation, and documents are rendered in the backend
+# (`app/utils/documents/render/`) with no script in this container to read
+# either.
+#
+# The fonts above stay. `run_python` is still a general Python tool and reportlab
+# is still on the package list, so a chat user asking for a PDF still needs a font
+# file to exist.
+
+# A hash of THIS FILE, passed in by ensure-sandbox-image.sh, which is the only
+# thing that can compute it: the Dockerfile is the build context here and cannot
+# read itself. It is the second half of the drift check. The packages label above
+# covers pip and nothing else, so the apt step, the env and the directory modes
+# were all outside the comparison, and an image built before the fonts were added
+# answered "matches" forever while every PDF failed on a missing font file.
+#
+# Declared last on purpose. An ARG invalidates the cache only for the layers
+# after it, so a change here costs one label layer rather than a full rebuild,
+# and a comment-only edit to this file rebuilds in seconds while still ending up
+# with an honest label.
+ARG SANDBOX_RECIPE=""
+LABEL orizon.sandbox.recipe="${SANDBOX_RECIPE}"
+
+# llm-sandbox creates the container detached and then execs into it, so the
+# image command only has to stay alive. python:slim's default CMD is a REPL,
+# which is fragile to rely on.
+CMD ["sleep", "infinity"]
+
+# Ten seconds of every single run, removed.
+#
+# llm-sandbox closes with `container.stop()`, which is SIGTERM, a ten-second
+# grace period, then SIGKILL. `sleep` is PID 1 here, and the kernel discards
+# default-action signals for PID 1 unless the process installs a handler, which
+# `sleep` does not. So the grace period elapsed IN FULL on every container, and
+# the sandbox daemon said so on 66 of the 67 containers it had ever created:
+#
+#     Container failed to exit within 10s of signal 15 - using the force
+#
+# Measured per-container lifetime was 10.26s to 11.00s, of which 0.26s to 1.00s
+# was the actual work. A document job paid it once per attempt.
+#
+# STOPSIGNAL is the fix from this side, and it has to be this side: the grace
+# period belongs to `container.stop()` inside the pinned llm-sandbox, which we do
+# not edit. SIGKILL is correct rather than merely expedient here, because the
+# container is destroyed immediately afterwards and holds nothing to flush: it is
+# a throwaway with one snippet's output already copied out.
+STOPSIGNAL SIGKILL

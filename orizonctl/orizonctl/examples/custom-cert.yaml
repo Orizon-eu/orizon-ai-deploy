@@ -1,0 +1,65 @@
+# GPU host behind a corporate domain with a certificate you already hold:
+# HTTPS via nginx from fullchain.pem + privkey.pem, local text and embedding
+# servers, the reranker served by another machine, Orizon Transcribe on with
+# its Telegram bot.
+#
+#   curl -fsSL https://raw.githubusercontent.com/Orizon-eu/orizon-ai-deploy/main/install.sh \
+#     | sudo bash -s -- --config /root/orizon.yaml
+#
+# Put the two PEM files in /opt/orizon/app/certs before `orizonctl up`
+# (checked there, not at configure time).
+
+install:
+  home: /opt/orizon
+  version: v1.3.0
+
+configure:
+  version: v1.3.0
+
+  registry:
+    prefix: scr.syneto.eu/orizon-ai/orizon-ai
+    username: "robot$orizon-ai-scr"
+    token: "CHANGE-ME"
+
+  models:
+    text: local
+    text_model: Qwen/Qwen3.6-35B-A3B-FP8
+    embedding: local
+    rerank: external
+    transcription: true
+  external:
+    rerank:
+      url: http://rerank.corp.example:8004
+      model: Qwen/Qwen3-Reranker-0.6B
+  models_path: /data/orizon-models
+
+  gpu:
+    tensor_parallel: 2         # two cards for the text server
+    max_model_len: 131072
+    embedding_device: "1"
+    transcription_device: "1"
+    diarization_device: "1"
+    fractions:
+      text: 0.80
+      embedding: 0.10
+      transcription: 0.40
+
+  access:
+    mode: custom-cert
+    domain: ai.corp.example
+    cert_dir: ./certs          # relative to /opt/orizon/app
+
+  ports:
+    postgres: 55432
+    frontend: 3000
+
+  telegram_bot_username: orizon_corp_bot
+  transcription:
+    hf_token: "CHANGE-ME"      # pyannote diarization is gated
+    telegram: true
+    bot_token: "CHANGE-ME"     # @BotFather
+    api_id: "CHANGE-ME"        # my.telegram.org
+    api_hash: "CHANGE-ME"
+
+  mcp: true
+  download_models: true

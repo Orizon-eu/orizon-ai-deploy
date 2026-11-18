@@ -1,0 +1,43 @@
+# OrizonAI nginx — HTTPS with a Let's Encrypt certificate
+#
+# The certbot service writes the certificate into the shared letsencrypt volume;
+# setup-ssl.sh switches to this template once it exists.
+#
+# Substituted at container start from .env.nginx:
+#   NGINX_DOMAIN — the name the certificate is issued for
+#   SERVER_PORT  — the backend's port on orizon-network
+# Routes and proxy settings live in nginx/orizon/, shared with the other templates.
+
+include /etc/nginx/orizon/http.conf;
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name ${NGINX_DOMAIN};
+
+    resolver ${NGINX_LOCAL_RESOLVERS} valid=10s;
+    set $orizon_frontend http://frontend:3000;
+    set $orizon_backend  http://backend:${SERVER_PORT};
+
+    if ($orizon_redirect_to_https) {
+        return 301 https://$host:${NGINX_HTTPS_PORT}$request_uri;
+    }
+
+    include /etc/nginx/orizon/routes.conf;
+}
+
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name ${NGINX_DOMAIN};
+
+    ssl_certificate     /etc/letsencrypt/live/${NGINX_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${NGINX_DOMAIN}/privkey.pem;
+    include /etc/nginx/orizon/tls.conf;
+
+    resolver ${NGINX_LOCAL_RESOLVERS} valid=10s;
+    set $orizon_frontend http://frontend:3000;
+    set $orizon_backend  http://backend:${SERVER_PORT};
+
+    include /etc/nginx/orizon/routes.conf;
+}
