@@ -113,6 +113,50 @@ class Stack:
             return (r.stderr or r.stdout).strip()
         return None
 
+    def service_images(self, mcp: bool = False, env: dict[str, str] | None = None) -> dict[str, str]:
+        """{service: image} as Compose resolves the file: active profiles, the
+        .env files and interpolation included."""
+        r = self.run("config", "--format", "json", mcp=mcp, check=False, capture=True, env=env)
+        if r.returncode != 0:
+            return {}
+        try:
+            data = json.loads(r.stdout)
+        except ValueError:
+            return {}
+        return {name: svc["image"] for name, svc in (data.get("services") or {}).items() if isinstance(svc, dict) and svc.get("image")}
+
+    def image_present(self, ref: str) -> bool:
+        return self.docker("image", "inspect", ref, check=False).returncode == 0
+
+    def unavailable_connectors(self, prefix: str, env: dict[str, str] | None = None) -> dict[str, str]:
+        """MCP services whose image lives under this deployment's registry
+        prefix but is neither on the host nor pullable: {service: image}.
+
+        Connectors are optional by nature (a deployment without mail has no
+        IMAP image in its registry), and `docker compose pull` on the whole
+        file fails as soon as one is missing. Images from elsewhere (the
+        docker-in-docker pair from Docker Hub) are not probed."""
+        out: dict[str, str] = {}
+        base = prefix.rstrip("/") + "/" if prefix else ""
+        for service, image in self.service_images(mcp=True, env=env).items():
+            if not base or not image.startswith(base):
+                continue
+            if self.image_present(image):
+                continue
+            ok, _ = image_accessible(image, self.runtime)
+            if not ok:
+                out[service] = image
+        return out
+
+    def connector_services(self, prefix: str, env: dict[str, str] | None = None) -> tuple[list[str], dict[str, str]]:
+        """The MCP services to pull and start, and the ones left out with the
+        image each lacks. Prints a warning per skipped connector."""
+        skipped = self.unavailable_connectors(prefix, env)
+        for service, image in skipped.items():
+            ui.warn(f"{service}: {image} is not in the registry; skipped (a deployment that does not use this connector needs no image)")
+        services = [s for s in self.config_services(mcp=True) if s not in skipped]
+        return services, skipped
+
     def container_ids(self, service: str, mcp: bool = False) -> list[str]:
         r = self.run("ps", "-aq", service, mcp=mcp, check=False, capture=True)
         return [c for c in r.stdout.split() if c]
@@ -148,12 +192,15 @@ class Stack:
     # ------------------------------------------------------------ operations
 
     def pull(self, services: list[str], mcp: bool = False, env: dict[str, str] | None = None) -> None:
+        """For the MCP file an empty list means every service; see
+        `connector_services` for the list that leaves out connectors whose
+        image this deployment cannot get."""
         if not services and not mcp:
             return
         # Every service here also carries a `build:` block, so no
         # --ignore-buildable: that would skip them all. `pull` fetches by the
         # `image:` name regardless of the build context.
-        self.run("pull", *([] if mcp else services), mcp=mcp, env=env)
+        self.run("pull", *services, mcp=mcp, env=env)
 
     def up(self, services: list[str], mcp: bool = False, build: bool = False, no_deps: bool = True) -> None:
         if not services and not mcp:
@@ -165,8 +212,7 @@ class Stack:
         elif no_deps:
             args.append("--no-deps")
         args.append("--build" if build else "--no-build")
-        if not mcp:
-            args += services
+        args += services
         self.run(*args, mcp=mcp)
 
     def down(self, mcp: bool = False, volumes: bool = False) -> None:
@@ -279,11 +325,16 @@ class Stack:
             ui.note(fix)
         wanted = [s for s in wanted if s in available]
 
+        mcp_on = state.mcp and self.has_file(mcp=True)
+        mcp_services: list[str] = []  # empty = the whole file
+        if mcp_on and not build:
+            mcp_services, _skipped = self.connector_services(values.get("ORIZON_IMAGE_PREFIX") or state.image_prefix)
+
         if pull and not build:
             ui.step(f"Pulling images for ORIZON_VERSION={values.get('ORIZON_VERSION', '?')}")
             self.pull(wanted)
-            if state.mcp and self.has_file(mcp=True):
-                self.pull([], mcp=True)
+            if mcp_on:
+                self.pull(mcp_services, mcp=True)
 
         ui.step("Starting the database")
         self.up([s for s in ["db"] if s in available], build=build)
@@ -323,11 +374,11 @@ class Stack:
         elif models:
             ok &= self.wait_models(models)
 
-        if state.mcp and self.has_file(mcp=True):
+        if mcp_on:
             ui.step("Starting the MCP connector stack")
-            self.up([], mcp=True, build=build)
-            mcp_services = [s for s in self.config_services(mcp=True) if s != "sandbox-image-loader"]
-            ok &= self.wait(mcp_services, 600, mcp=True, label="connectors")
+            self.up(mcp_services, mcp=True, build=build)
+            to_wait = [s for s in (mcp_services or self.config_services(mcp=True)) if s != "sandbox-image-loader"]
+            ok &= self.wait(to_wait, 600, mcp=True, label="connectors")
 
         for mcp in (False, True):
             if mcp and not (state.mcp and self.has_file(mcp=True)):
