@@ -159,7 +159,7 @@ def _run_checks(repo: Path, state: State | None, values: dict[str, str], gpu_smo
     # ------------------------------------------------------------------ GPU
     gpus = h.nvidia_gpus()
     if gpus:
-        names = ", ".join(f"[{g.index}] {g.name} {g.memory_label()}" for g in gpus)
+        names = ", ".join(f"[{g.index}] {g.name} {g.memory_mib // 1024} GiB" for g in gpus)
         checks.append(_ok("NVIDIA driver", f"{gpus[0].driver}; {names}"))
     elif wants_gpu:
         if h.nvidia_hardware_present():

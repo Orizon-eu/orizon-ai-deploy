@@ -5,7 +5,7 @@ then asks a dozen questions, writes every env file the stack needs, downloads
 the model weights and brings the containers up in the right order.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Orizon-eu/orizon-ai-deploy/main/install.sh | sudo bash
+curl -fsSL https://gitlab.syneto.eu/orizon-ai/orizon-ai-deploy/-/raw/main/install.sh | sudo bash
 ```
 
 ## 0. Distribution model
@@ -14,7 +14,7 @@ Three things reach a customer host, and the application source is not one of the
 
 | What | Where it lives | Visibility | How it gets to the host |
 |---|---|---|---|
-| `install.sh` | public project `Orizon-eu/orizon-ai-deploy` on GitHub | public | `curl` |
+| `install.sh` | public project `orizon-ai/orizon-ai-deploy` on GitLab | public | `curl` |
 | `orizonctl` + the deployment files it carries (compose files, env templates, nginx templates, helper scripts) | same public project, `orizonctl/`; released as tags `vX.Y.Z` | public | `pip install git+…@vX.Y.Z#subdirectory=orizonctl` into `/opt/orizon/venv` |
 | container images | Harbor: pushed to `harbor.syneto.eu/orizon-ai`, pulled through the proxy cache `scr.syneto.eu/orizon-ai/orizon-ai` | private | `docker pull`, after the `docker login` the wizard performs with a robot account |
 | application source (this monorepo, four submodules) | `gitlab.syneto.eu/orizon-ai/*` | private | never |
@@ -266,6 +266,49 @@ In order, and it stops at the first failure with the previous state intact:
 
 A failed step after the snapshot prints the rollback command (and asks on a terminal). The snapshot's manifest records `applied` when the update went through.
 
+#### One service on another image
+
+To redeploy a single component (a backend hotfix, a test build) without moving the release, name the service:
+
+```bash
+sudo orizonctl update backend --version v1.3.1-hotfix          # another tag of the same image
+sudo orizonctl update backend --image scr.syneto.eu/orizon-ai/orizon-ai/orizon-ai-backend:test-7   # any image
+sudo orizonctl update backend                                  # re-pull its current tag and restart it
+sudo orizonctl update backend frontend --version v1.3.1        # several services, one tag
+sudo orizonctl update backend --unpin                          # back to the release's image (ORIZON_VERSION)
+```
+
+Service names are the Compose ones (`orizonctl info` lists them; connectors such as `mcp-github` work too). What happens: a snapshot as above (`--no-backup`, `--no-data` apply), the image is pulled while the old container still runs, then only the named containers are recreated (`up -d --no-deps`) and waited on. `ORIZON_VERSION`, `orizonctl`, the deployment files and the env files are not touched.
+
+The choice is recorded in `.orizon/state.json` and rendered into a Compose override file, `.orizon/overrides.yml` (`overrides.mcp.yml` for connectors), which every later `orizonctl` command loads after the main compose file, so `up`, `restart` and `pull` keep the service on its image. `orizonctl info` shows what is pinned. A release update (`update --version` / `--latest`) drops the pins and moves every service to the release; `--keep-pins` keeps them. Plain `docker compose` in `/opt/orizon/app` does not read the override file unless you pass it with `-f`.
+
+#### A container the release does not have
+
+`update SERVICE` only moves services the installed compose files define. To run one they do not define (a connector a later release ships, on a host that stays on this one; a customer-specific tool):
+
+```bash
+sudo orizonctl service add mcp-imap --port 8111                        # <prefix>/orizon-mcp-imap at ORIZON_VERSION
+sudo orizonctl service add mcp-imap --port 8111 --version v1.4.0_dev   # another tag of that image
+sudo orizonctl service add my-tool --image reg/team/tool:1 --port 9000 --env MODE=prod
+sudo orizonctl service list
+sudo orizonctl service remove mcp-imap
+```
+
+A name starting with `mcp-` joins the connector stack and is set up like the bundled connectors: `.env.mcp`, `MCP_PORT`, `MCP_CRED_VARS` (`--cred-vars`), the port health check, and the wiring the backend needs, i.e. `MCP_<X>_URL=http://mcp-<x>:<port>/mcp` in `.env` and its two entries in `MCP_ALLOWED_HOSTS` in `.env.mcp` (`--no-wire` skips both; `remove` takes back what `add` wrote). The backend reads its URL key at start, so follow with `orizonctl up`, or with `orizonctl update backend --version ...` when the connector needs a newer backend anyway. Anything else joins the main stack on `orizon-network` with the image, port and environment given. The port is not published on the host unless `--publish`.
+
+The service is recorded in `.orizon/state.json` and rendered into the same override files, so it starts and stops with the stack, `orizonctl update NAME --image ...` moves it, and a rollback restores it. When a release update brings a compose file that defines the service itself, the added copy is dropped and the release's takes over.
+
+#### orizonctl itself, without a new release
+
+A fix to the CLI or to its bundled files, published again under the same tag (`publish-installer.sh` moves the tag) or sitting on a branch, reaches a host with:
+
+```bash
+sudo orizonctl self-update                 # the CLI source at the release this host runs (ORIZON_VERSION)
+sudo orizonctl self-update --ref main      # a branch or another tag
+```
+
+It force-reinstalls the package into `/opt/orizon/venv` (a republished tag has the same package version, which a plain upgrade would skip), then the new copy writes its bundled deployment files into the app directory, keeping any you edited. Images, `ORIZON_VERSION`, env files and running containers are not touched; `orizonctl up` applies whatever changed in the files.
+
 ### 4.2 Rolling back
 
 ```bash
@@ -297,7 +340,7 @@ One YAML file carries the whole install. `install:` is read by `install.sh`
 per question, and is what `orizonctl setup` and `configure` read.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Orizon-eu/orizon-ai-deploy/main/install.sh \
+curl -fsSL https://gitlab.syneto.eu/orizon-ai/orizon-ai-deploy/-/raw/main/install.sh \
   | sudo bash -s -- --config /root/orizon.yaml          # install, then `orizonctl setup --non-interactive --config`
 sudo orizonctl setup --non-interactive --config /root/orizon.yaml     # on a host where install.sh already ran
 sudo orizonctl configure --config /root/orizon.yaml                   # re-configure; answered questions are not asked
@@ -468,7 +511,7 @@ docker login harbor.syneto.eu
 git commit -am "Release vX.Y.Z"
 
 # 3. publish install.sh + orizonctl/ to the public project and tag it
-git clone git@github.com:Orizon-eu/orizon-ai-deploy.git ../orizon-ai-deploy   # once
+git clone git@gitlab.syneto.eu:orizon-ai/orizon-ai-deploy.git ../orizon-ai-deploy   # once
 ./deploy/publish-installer.sh vX.Y.Z ../orizon-ai-deploy --push
 ```
 

@@ -12,15 +12,17 @@ import click
 
 from . import __version__, ui
 from . import backup as bk
+from . import envfile as _envfile
 from . import hostinfo as h
 from . import migrate as mig
+from . import pins as _pins
 from .assets import app_dir_is_materialized, is_bundle_available, materialize
 from .config import ConfigError, example_names, example_text, load_config
-from .compose import ComposeError, Stack, check_custom_cert, ensure_dirs, image_accessible
+from .compose import APP_TIMEOUT, MODEL_TIMEOUT, ComposeError, Stack, check_custom_cert, ensure_dirs, image_accessible
 from .envfile import load, missing_keys
 from .preflight import apply_host_fixes, has_failures, print_checks, run_checks
-from .schema import PROBE_IMAGE, TEMPLATES, EnvFile, available_files, is_secret_name
-from .state import State
+from .schema import FILE_MODES, PROBE_IMAGE, TEMPLATES, EnvFile, available_files, is_secret_name
+from .state import STATE_DIR, State
 from .wizard import Wizard, WizardError, current_values, load_answers
 from .writer import describe, write_env_files
 
@@ -36,6 +38,17 @@ class Ctx:
         self.app_dir = app_dir
         self.home = home
         self.stack = Stack(app_dir)
+        self.sync_pins()
+
+    def sync_pins(self) -> None:
+        """Bring the per-service image override files in line with the state
+        (they are derived from it; see pins.py)."""
+        if not (self.app_dir / STATE_DIR).is_dir():
+            return
+        try:
+            _pins.sync(self.app_dir, self.state)
+        except OSError as e:
+            ui.warn(f"could not write the image pin files under {self.app_dir / STATE_DIR}: {e}")
 
     def require_app(self) -> Path:
         if not app_dir_is_materialized(self.app_dir):
@@ -166,6 +179,11 @@ def _configure(ctx: Ctx, interactive: bool, answers_path: str | None, dry_run: b
         raise click.ClickException("--non-interactive needs --config on a first run (nothing to reuse yet)")
     wiz = Wizard(ctx.app_dir, interactive=interactive, answers=answers, previous=ctx.state)
     values, state = wiz.run()
+    previous = ctx.state
+    if previous is not None:
+        # not wizard questions: a service moved with `update <service>` stays where it is
+        state.image_pins, state.mcp_image_pins = previous.image_pins, previous.mcp_image_pins
+        state.extra_services = previous.extra_services  # nor one added with `service add`
 
     ui.header("Files")
     describe(values, available_files(ctx.app_dir))
@@ -424,8 +442,7 @@ def pull(ctx: Ctx) -> None:
     try:
         ctx.stack.pull([s for s in st.all_services() if s in ctx.stack.config_services()])
         if st.mcp and ctx.stack.has_file(mcp=True):
-            services, _ = ctx.stack.connector_services(ctx.values.get("ORIZON_IMAGE_PREFIX") or st.image_prefix)
-            ctx.stack.pull(services, mcp=True)
+            ctx.stack.pull([], mcp=True)
     except ComposeError as e:
         raise click.ClickException(str(e))
     ui.ok("images pulled")
@@ -598,8 +615,7 @@ def _pull_target(ctx: Ctx, st: State, target: str) -> None:
     ui.step(f"Pulling images at {target}")
     ctx.stack.pull(services, env={"ORIZON_VERSION": target})
     if st.mcp and ctx.stack.has_file(mcp=True):
-        connectors, _ = ctx.stack.connector_services(prefix, env={"ORIZON_VERSION": target})
-        ctx.stack.pull(connectors, mcp=True, env={"ORIZON_VERSION": target})
+        ctx.stack.pull([], mcp=True, env={"ORIZON_VERSION": target})
 
 
 def _parse_sets(sets: tuple[str, ...]) -> dict[str, str]:
@@ -711,8 +727,141 @@ def _failed_update_hint(snap: bk.Snapshot | None, interactive: bool) -> None:
         ui.note(f"orizonctl rollback {snap.name}")
 
 
+def _fetch_image(ctx: Ctx, st: State, ref: str) -> None:
+    """Get `ref` onto this host before anything changes: pulled when a registry
+    serves it, else accepted when a copy is already here (a locally loaded build)."""
+    reachable, msg = image_accessible(ref)
+    if reachable:
+        ctx.stack.pull_image(ref)
+        ui.ok(f"pulled {ref}")
+    elif ctx.stack.docker("image", "inspect", ref, check=False).returncode == 0:
+        ui.warn(f"{ref} is not in a registry this host can reach ({msg}); using the copy already on this host")
+    else:
+        hint = f"docker login {st.registry_host}" if st.registry_host != "docker.io" else "docker login"
+        raise click.ClickException(f"cannot reach {ref}: {msg}. Is it pushed? Check the registry login ({hint}). Nothing changed.")
+
+
+def _update_services(ctx: Ctx, st: State, services: tuple[str, ...], version: str | None, image: str | None, unpin: bool, no_backup: bool, no_data: bool, interactive: bool, yes: bool) -> None:
+    """Move the named services to another image and recreate only them. The
+    release (ORIZON_VERSION, orizonctl, deployment files, env files) stays."""
+    if sum(map(bool, (version, image, unpin))) > 1:
+        raise click.ClickException("--version, --image and --unpin are exclusive")
+    services = tuple(dict.fromkeys(services))
+    if image and len(services) != 1:
+        raise click.ClickException("--image names one image, so it takes exactly one service")
+    if image and not _pins.valid_ref(image):
+        raise click.ClickException(f"not an image reference: {image!r}")
+    if version and not _pins.valid_ref(version):
+        raise click.ClickException(f"not an image tag: {version!r}")
+
+    has_mcp = st.mcp and ctx.stack.has_file(mcp=True)
+    current = {False: ctx.stack.image_refs(), True: ctx.stack.image_refs(mcp=True) if has_mcp else {}}
+    unknown = [s for s in services if s not in current[False] and s not in current[True]]
+    if unknown:
+        raise click.ClickException(f"not a service of the configured stack: {', '.join(unknown)}. Services: {', '.join(sorted({**current[False], **current[True]}))}")
+
+    changes: list[tuple[str, bool, str, str, bool]] = []  # service, mcp, old ref, new ref, pinned
+    for mcp in (False, True):
+        group = [s for s in services if s in current[mcp]]
+        if not group:
+            continue
+        base = ctx.stack.image_refs(mcp=mcp, pins=False)
+        tagged = ctx.stack.image_refs(mcp=mcp, pins=False, env={"ORIZON_VERSION": version}) if version else {}
+        for s in group:
+            added = st.extra_services.get(s)
+            if added is not None:
+                # no release image underneath: the choice replaces the one `service add` recorded
+                if unpin:
+                    raise click.ClickException(f"{s} was added with `service add`, so there is no release image to return to; `orizonctl service remove {s}` takes it out")
+                new = image or (_pins.retag(added["image"], version) if version else current[mcp][s])
+                changes.append((s, mcp, current[mcp][s], new, False))
+                continue
+            if image:
+                new = image
+            elif version:
+                new = tagged.get(s, "")
+                if not new.endswith(":" + version):
+                    raise click.ClickException(f"{s} runs {base.get(s) or '?'}, which does not follow ORIZON_VERSION; name its image with --image")
+            elif unpin:
+                new = base.get(s, "")
+            else:
+                new = current[mcp][s]
+            if not new:
+                raise click.ClickException(f"{s} has no image in the compose file")
+            changes.append((s, mcp, current[mcp][s], new, new != base.get(s)))
+
+    ui.header(f"Update {', '.join(services)} (the rest of the stack stays on {st.version})")
+    for s, _mcp, old, new, pinned in changes:
+        ui.kv(s, (f"{old} -> {new}" if new != old else f"{new} (re-pull + restart)") + ("   [added service]" if s in st.extra_services else "   [pinned]" if pinned else "   [follows ORIZON_VERSION]"), width=24)
+    if not yes and interactive and not click.confirm("Continue?", default=True):
+        raise click.Abort()
+
+    snap: bk.Snapshot | None = None
+    if not no_backup:
+        ui.header("Snapshot")
+        try:
+            snap = _snapshot(ctx, "update", to_version=", ".join(f"{s}:{_pins.tag_of(new)}" for s, _m, _o, new, _p in changes), include_data=not no_data)
+        except ComposeError as e:
+            raise click.ClickException(f"snapshot failed, nothing changed: {e}")
+    else:
+        ui.warn("--no-backup: no snapshot, so no rollback afterwards")
+
+    written = False
+    try:
+        ui.header("Images")
+        for ref in dict.fromkeys(new for _s, _m, _o, new, _p in changes):
+            _fetch_image(ctx, st, ref)
+
+        for s, mcp, _old, new, pinned in changes:
+            table = st.mcp_image_pins if mcp else st.image_pins
+            if s in st.extra_services:
+                st.extra_services[s]["image"] = new
+            elif pinned:
+                table[s] = new
+            else:
+                table.pop(s, None)
+        st.save(ctx.app_dir)
+        ctx.sync_pins()
+        written = True
+
+        ui.header("Restart")
+        ok = True
+        for mcp in (False, True):
+            group = [s for s, m, _o, _n, _p in changes if m == mcp]
+            if not group:
+                continue
+            ui.step(f"Recreating {', '.join(group)}")
+            ctx.stack.recreate(group, mcp=mcp)
+            timeout = MODEL_TIMEOUT if any(s in st.model_services() for s in group) else APP_TIMEOUT
+            ok &= ctx.stack.wait(group, timeout, mcp=mcp, label="update")
+        if ok and any(s in ("backend", "frontend", "nginx") and not m for s, m, _o, _n, _p in changes):
+            ok &= ctx.stack._wait_http(ctx.values, st)
+    except click.ClickException as e:  # ComposeError is one
+        ui.fail(e.format_message())
+        ok = False
+
+    if snap:
+        snap.manifest.status = "applied" if ok else "update-failed"
+        snap.save()
+    if not ok:
+        if written:
+            ui.note(f"the image choice is recorded; to go back to the release's image: orizonctl update {' '.join(s for s in services if s not in st.extra_services) or '<service>'} --unpin")
+        _failed_update_hint(snap, interactive)
+        raise SystemExit(1)
+    ui.header("Done")
+    pinned_now = {**st.image_pins, **st.mcp_image_pins}
+    if pinned_now:
+        ui.kv("Pinned", ", ".join(f"{s}={_pins.tag_of(r)}" for s, r in sorted(pinned_now.items())) + "   (`orizonctl update <service> --unpin` returns one to ORIZON_VERSION)")
+    if snap:
+        ui.kv("Rollback", f"orizonctl rollback {snap.name}")
+
+
 @main.command()
-@click.option("--version", "version", help="Release to move to, e.g. v1.3.0: upgrades orizonctl, its bundled files and ORIZON_VERSION together.")
+@click.argument("services", nargs=-1)
+@click.option("--version", "version", help="Release to move to, e.g. v1.3.0: upgrades orizonctl, its bundled files and ORIZON_VERSION together. With SERVICES: the image tag for those services only.")
+@click.option("--image", help="With one SERVICE: the full image reference to run it on (registry/path/name:tag).")
+@click.option("--unpin", is_flag=True, help="With SERVICES: return them to the release's image (ORIZON_VERSION).")
+@click.option("--keep-pins", is_flag=True, help="On a release update, keep services pinned with `update SERVICE` on their image (default: every service moves to the release).")
 @click.option("--latest", is_flag=True, help="Move to the newest release tag the registry holds.")
 @click.option("--cli-source", help="pip spec template for the CLI (default: what install.sh recorded in $ORIZON_HOME/config.json).")
 @click.option("--no-backup", is_flag=True, help="Skip the snapshot (no rollback possible afterwards).")
@@ -725,7 +874,7 @@ def _failed_update_hint(snap: bk.Snapshot | None, interactive: bool) -> None:
 @click.option("--yes", is_flag=True, help="Do not ask for confirmation before changing anything.")
 @click.option("--snapshot", "snapshot_name", hidden=True, help="(internal) the snapshot the first stage already took.")
 @pass_ctx
-def update(ctx: Ctx, version: str | None, latest: bool, cli_source: str | None, no_backup: bool, no_data: bool, no_cli_upgrade: bool, force_assets: bool, non_interactive: bool, sets: tuple[str, ...], keep_existing: bool, yes: bool, snapshot_name: str | None) -> None:
+def update(ctx: Ctx, services: tuple[str, ...], version: str | None, image: str | None, unpin: bool, keep_pins: bool, latest: bool, cli_source: str | None, no_backup: bool, no_data: bool, no_cli_upgrade: bool, force_assets: bool, non_interactive: bool, sets: tuple[str, ...], keep_existing: bool, yes: bool, snapshot_name: str | None) -> None:
     """Upgrade to a release, with a snapshot to roll back to.
 
     \b
@@ -736,10 +885,31 @@ def update(ctx: Ctx, version: str | None, latest: bool, cli_source: str | None, 
     across the new templates (new keys are asked for); bump ORIZON_VERSION;
     phased restart; verify. Database migrations run when the new frontend
     starts. If anything fails: `orizonctl rollback`.
+
+    \b
+    With SERVICES, only those move and nothing else is touched (no orizonctl
+    upgrade, no file or env changes, ORIZON_VERSION stays):
+      orizonctl update backend --version v1.3.1      another tag of its image
+      orizonctl update backend --image reg/x/y:tag   any image
+      orizonctl update backend                       re-pull its tag, restart
+      orizonctl update backend --unpin               back to ORIZON_VERSION
+    The choice is kept across `up` and restarts until --unpin or the next
+    release update. Service names: `orizonctl info`.
     """
     st = ctx.require_state()
     interactive = not non_interactive and _on_terminal()
     set_values = _parse_sets(sets)
+
+    if services:
+        if latest or set_values:
+            raise click.ClickException("--latest and --set belong to a release update; with service names use --version, --image or --unpin")
+        try:
+            _update_services(ctx, st, services, version, image, unpin, no_backup, no_data, interactive, yes)
+        except ComposeError as e:
+            raise click.ClickException(e.format_message())
+        return
+    if image or unpin:
+        raise click.ClickException("--image and --unpin need a service name, e.g. `orizonctl update backend --unpin`")
 
     target = _resolve_target(ctx, st, version, latest, interactive)
     ui.header(f"Update {st.version} -> {target or st.version + ' (same release: re-pull + restart)'}")
@@ -787,6 +957,8 @@ def update(ctx: Ctx, version: str | None, latest: bool, cli_source: str | None, 
                 rest.append("--non-interactive")
             if keep_existing:
                 rest.append("--keep-existing")
+            if keep_pins:
+                rest.append("--keep-pins")
             for k, v in set_values.items():
                 rest += ["--set", f"{k}={v}"]
             code = subprocess.call(rest)
@@ -800,6 +972,9 @@ def update(ctx: Ctx, version: str | None, latest: bool, cli_source: str | None, 
             _materialize(ctx, force=force_assets)
         else:
             ui.info("no bundled files in this build (source checkout); leaving the app directory as is")
+        for name in _now_in_release(ctx, st):
+            st.extra_services.pop(name)
+            ui.ok(f"{name}: defined by this release's compose file now; the copy added with `service add` is dropped")
 
         ui.header("Env files")
         _migrate_env(ctx, old_templates, interactive, set_values, keep_existing)
@@ -808,7 +983,14 @@ def update(ctx: Ctx, version: str | None, latest: bool, cli_source: str | None, 
             write_env_files(ctx.app_dir, {"ORIZON_VERSION": target})
             st.version = target
             ui.ok(f"ORIZON_VERSION={target}")
+            pinned = {**st.image_pins, **st.mcp_image_pins}
+            if pinned and not keep_pins:
+                ui.warn(f"image pins dropped, these move to {target} with the rest: {', '.join(sorted(pinned))}  (--keep-pins keeps them)")
+                st.image_pins, st.mcp_image_pins = {}, {}
+            elif pinned:
+                ui.info(f"still pinned to their own image: {', '.join(sorted(pinned))}")
         st.save(ctx.app_dir)
+        ctx.sync_pins()
 
         ok = _up(ctx, pull=True, build=False, skip_preflight=False, download=False)
     except (ComposeError, click.ClickException) as e:
@@ -825,6 +1007,266 @@ def update(ctx: Ctx, version: str | None, latest: bool, cli_source: str | None, 
     if not ok:
         _failed_update_hint(snap, interactive)
         raise SystemExit(1)
+
+
+# ----------------------------------------------------------- self-update
+
+
+@main.command("self-update")
+@click.option("--ref", help="Tag or branch of the CLI source to install (default: the release this host runs, ORIZON_VERSION). `main` takes the newest published copy.")
+@click.option("--cli-source", help="pip spec template for the CLI (default: what install.sh recorded in $ORIZON_HOME/config.json).")
+@click.option("--no-files", is_flag=True, help="Only reinstall orizonctl; do not write its bundled deployment files into the app directory.")
+@pass_ctx
+def self_update(ctx: Ctx, ref: str | None, cli_source: str | None, no_files: bool) -> None:
+    """Reinstall orizonctl itself, without moving the release.
+
+    \b
+    For a fix to the CLI or its bundled files that was published again under
+    the same release tag (or sits on a branch): the images, ORIZON_VERSION,
+    the env files and the running containers are not touched. Afterwards the
+    new copy writes its deployment files (yours, if edited, are kept), and
+    `orizonctl up` applies whatever changed in them.
+    """
+    template = cli_source or ctx.home_config().get("cli_source")
+    if not template:
+        raise click.ClickException("no CLI source recorded (install.sh writes it to $ORIZON_HOME/config.json); pass --cli-source")
+    st = ctx.state
+    ref = ref or (st.version if st and st.version else f"v{__version__}")
+    spec = resolve_cli_spec(template, ref)
+    ui.header(f"orizonctl {__version__} -> {ref}")
+    # A republished tag carries the same package version, which a plain
+    # --upgrade would call satisfied: install dependencies first, then force
+    # the package itself (install.sh does the same).
+    for flags in (["--upgrade"], ["--force-reinstall", "--no-deps", "--no-cache-dir"]):
+        ui.step(f"pip install {' '.join(flags)} {spec}")
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", *flags, spec], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise click.ClickException(f"pip failed, the installed orizonctl is unchanged or was restored by pip:\n{r.stderr.strip()[-1500:]}")
+    if cli_source:
+        ctx.save_home_config({**ctx.home_config(), "cli_source": cli_source})
+    newbin = _self_bin()
+    r = subprocess.run([newbin, "--version"], capture_output=True, text=True)
+    ui.ok(f"installed: {(r.stdout or '').strip() or newbin}")
+    if no_files:
+        return
+    # the new code's bundle, written by the new code
+    code = subprocess.call([newbin, "--home", str(ctx.home), "--app-dir", str(ctx.app_dir), "init"])
+    if code != 0:
+        raise SystemExit(code)
+    ui.note("containers were not touched; `orizonctl up` applies any change in the deployment files")
+
+
+# --------------------------------------------------------------- service
+
+
+def _now_in_release(ctx: Ctx, st: State) -> list[str]:
+    """Added services that the compose files themselves define (a later release
+    brought them): keeping both would merge two definitions of one service."""
+    out = []
+    for mcp in (False, True):
+        names = [n for n, s in st.extra_services.items() if bool(s.get("mcp")) == mcp]
+        if names and ctx.stack.has_file(mcp=mcp):
+            defined = set(ctx.stack.every_service(mcp=mcp, pins=False))
+            out += [n for n in names if n in defined]
+    return out
+
+
+def _set_env(app_dir: Path, f: EnvFile, values: dict[str, str], remove: set[str] | None = None) -> None:
+    """Set (and drop) keys in one env file in place, comments kept."""
+    target = app_dir / f.value
+    base = (target if target.exists() else app_dir / TEMPLATES[f]).read_text(encoding="utf-8")
+    text = _envfile.render(base, values) if values else base
+    if remove:
+        text = _envfile.drop(text, remove)
+    _envfile.write_atomic(target, text, FILE_MODES[f])
+
+
+def _connector_wiring(name: str, port: int) -> tuple[str, str, list[str]]:
+    """What the backend and the connectors need to know about `mcp-<x>` on
+    `port`: its URL key in .env, and its Host-header entries for .env.mcp."""
+    key = f"MCP_{name[4:].upper().replace('-', '_')}_URL"
+    return key, f"http://{name}:{port}/mcp", [f"{name}:{port}", f"localhost:{port}"]
+
+
+def _wire_connector(ctx: Ctx, name: str, port: int) -> dict:
+    """Returns what was added, so `service remove` takes back exactly that."""
+    key, url, hosts = _connector_wiring(name, port)
+    wired: dict = {}
+    mcp_env = load(ctx.app_dir / EnvFile.MCP.value)
+    if "MCP_ALLOWED_HOSTS" in mcp_env:
+        allowed = [h.strip() for h in mcp_env["MCP_ALLOWED_HOSTS"].split(",") if h.strip()]
+        new = [h for h in hosts if h not in allowed]
+        if new:
+            _set_env(ctx.app_dir, EnvFile.MCP, {"MCP_ALLOWED_HOSTS": ",".join(allowed + new)})
+            wired["hosts"] = new
+            ui.ok(f".env.mcp: MCP_ALLOWED_HOSTS += {', '.join(new)}")
+    else:
+        ui.warn(f".env.mcp has no MCP_ALLOWED_HOSTS; if the connector answers 421, add {', '.join(hosts)} to it")
+    current = ctx.values.get(key)
+    if current is None:
+        _set_env(ctx.app_dir, EnvFile.ENV, {key: url})
+        wired["url_key"] = key
+        ui.ok(f".env: {key}={url}")
+    elif current != url:
+        ui.warn(f".env already has {key}={current}; left as is (the container listens at {url})")
+    return wired
+
+
+def _unwire_connector(ctx: Ctx, name: str, spec: dict) -> None:
+    wired = spec.get("wired") or {}
+    hosts = set(wired.get("hosts") or [])
+    mcp_env = load(ctx.app_dir / EnvFile.MCP.value)
+    if hosts and "MCP_ALLOWED_HOSTS" in mcp_env:
+        kept = [h.strip() for h in mcp_env["MCP_ALLOWED_HOSTS"].split(",") if h.strip() and h.strip() not in hosts]
+        _set_env(ctx.app_dir, EnvFile.MCP, {"MCP_ALLOWED_HOSTS": ",".join(kept)})
+        ui.ok(f".env.mcp: MCP_ALLOWED_HOSTS -= {', '.join(sorted(hosts))}")
+    key = wired.get("url_key")
+    if key and spec.get("port") and ctx.values.get(key) == _connector_wiring(name, int(spec["port"]))[1]:
+        _set_env(ctx.app_dir, EnvFile.ENV, {}, remove={key})
+        ui.ok(f".env: {key} removed")
+
+
+@main.group()
+def service() -> None:
+    """Containers this deployment runs beyond the release's compose files.
+
+    \b
+    `add` puts one in (for example a connector a later release ships, on a
+    host that stays on the current one); `remove` takes it out; `list` shows
+    them. They start and stop with the stack. To change the image of one, or
+    of any release service: `orizonctl update SERVICE --image ...`.
+    """
+
+
+@service.command("add")
+@click.argument("name")
+@click.option("--image", help="Image reference to run. For mcp-<x> the default is <prefix>/orizon-mcp-<x> at --version.")
+@click.option("--version", "tag", help="Tag of the default image (default: ORIZON_VERSION).")
+@click.option("--port", type=click.IntRange(1, 65535), help="Port the container listens on. A connector gets it as MCP_PORT and is health-checked on it.")
+@click.option("--publish", is_flag=True, help="Also publish --port on the host (default: reachable only inside orizon-network).")
+@click.option("--env", "envs", multiple=True, metavar="KEY=VALUE", help="Environment variable for the container; repeatable.")
+@click.option("--cred-vars", default="", help="Connectors: MCP_CRED_VARS, the variables a request's bearer token is forwarded as (e.g. ACCESS_TOKEN).")
+@click.option("--stack", type=click.Choice(["main", "mcp"]), help="Compose stack to join (default: mcp for a name starting with mcp-, else main).")
+@click.option("--no-wire", is_flag=True, help="Connectors: do not add it to MCP_ALLOWED_HOSTS (.env.mcp) or set MCP_<X>_URL (.env).")
+@click.option("--yes", is_flag=True, help="Do not ask for confirmation.")
+@pass_ctx
+def service_add(ctx: Ctx, name: str, image: str | None, tag: str | None, port: int | None, publish: bool, envs: tuple[str, ...], cred_vars: str, stack: str | None, no_wire: bool, yes: bool) -> None:
+    """Add a container the release's compose files do not define, and start it.
+
+    \b
+      orizonctl service add mcp-imap --port 8111
+      orizonctl service add mcp-imap --port 8111 --version v1.4.0_dev
+      orizonctl service add my-tool --image reg/team/tool:1 --port 9000 --env MODE=prod
+
+    \b
+    A connector (mcp-<x>, MCP stack) is set up like the bundled ones: .env.mcp,
+    MCP_PORT, health check, and the wiring the backend needs (--no-wire skips
+    it). Anything else joins orizon-network with the image, port and
+    environment given here. Running `add` again for the same name replaces it.
+    """
+    st = ctx.require_state()
+    if not _pins.valid_name(name):
+        raise click.ClickException(f"not a service name: {name!r} (lowercase letters, digits, - and _)")
+    mcp = (stack == "mcp") if stack else name.startswith("mcp-")
+    if mcp and not (st.mcp and ctx.stack.has_file(mcp=True)):
+        raise click.ClickException("the connector (MCP) stack is off on this deployment; turn it on in `orizonctl configure` first, or pass --stack main")
+    for m in (False, True):
+        if ctx.stack.has_file(mcp=m) and name in ctx.stack.every_service(mcp=m, pins=False):
+            file = "docker-compose.mcp.yml" if m else "docker-compose.yml"
+            raise click.ClickException(f"{name} is already a service of {file}. To run it on another image: orizonctl update {name} --image ...  (if it is not running, its compose profile is off: `orizonctl configure`)")
+    if image and tag:
+        raise click.ClickException("--image and --version are exclusive")
+    if not image:
+        if not name.startswith("mcp-"):
+            raise click.ClickException("--image is needed (only mcp-<x> connectors have a default image name)")
+        image = f"{ctx.values.get('ORIZON_IMAGE_PREFIX') or st.image_prefix}/orizon-{name}:{tag or st.version}"
+    if not _pins.valid_ref(image):
+        raise click.ClickException(f"not an image reference: {image!r}")
+    env = _parse_sets(envs)
+    wire = mcp and name.startswith("mcp-") and bool(port) and not no_wire
+    previous = st.extra_services.get(name)
+
+    ui.header(f"{'Replace' if previous else 'Add'} service {name}")
+    ui.kv("image", image)
+    ui.kv("stack", "MCP connectors (docker-compose.mcp.yml)" if mcp else "main (docker-compose.yml)")
+    ui.kv("port", (f"{port}" + (" (published on the host)" if publish else " (orizon-network only)")) if port else "none")
+    if env:
+        ui.kv("environment", ", ".join(sorted(env)))
+    if wire:
+        key, url, hosts = _connector_wiring(name, port)
+        ui.kv("wiring", f"{key}={url} in .env; {', '.join(hosts)} in MCP_ALLOWED_HOSTS")
+    elif mcp and not port:
+        ui.warn("no --port: the connector keeps its image's default port, gets no health check and is not wired to the backend")
+    if not yes and _on_terminal() and not click.confirm("Continue?", default=True):
+        raise click.Abort()
+
+    try:
+        ui.header("Image")
+        _fetch_image(ctx, st, image)
+        spec: dict = {"image": image, "mcp": mcp, "port": port, "publish": publish, "env": env, "cred_vars": cred_vars}
+        if previous:
+            _unwire_connector(ctx, name, previous)
+        if wire:
+            spec["wired"] = _wire_connector(ctx, name, port)
+        st.extra_services[name] = spec
+        st.save(ctx.app_dir)
+        ctx.sync_pins()
+        err = ctx.stack.validate_config(mcp=mcp)
+        if err:
+            raise click.ClickException(f"docker compose config rejects the service:\n{err}")
+        ui.header("Start")
+        ctx.stack.recreate([name], mcp=mcp)
+        ok = ctx.stack.wait([name], APP_TIMEOUT, mcp=mcp, label=name)
+    except ComposeError as e:
+        ui.fail(e.format_message())
+        ok = False
+    if not ok:
+        if name in (ctx.state.extra_services if ctx.state else {}):
+            ui.note(f"the service is recorded; fix and re-run, or take it out: orizonctl service remove {name}")
+        raise SystemExit(1)
+    ui.header("Done")
+    if port:
+        ui.kv("Reachable at", f"http://{name}:{port}{'/mcp' if mcp else ''}  (from the stack's containers)")
+    if wire and spec.get("wired", {}).get("url_key"):
+        ui.kv("Backend", f"reads {spec['wired']['url_key']} when it starts: `orizonctl up` recreates it with the new value (or `orizonctl update backend ...` if it moves to a new image anyway)")
+    if mcp:
+        ui.kv("Panel", "a backend that does not know this connector can attach it under Settings > External MCP at the URL above")
+
+
+@service.command("remove")
+@click.argument("name")
+@click.option("--yes", is_flag=True, help="Do not ask for confirmation.")
+@pass_ctx
+def service_remove(ctx: Ctx, name: str, yes: bool) -> None:
+    """Stop and remove a container added with `service add`."""
+    st = ctx.require_state()
+    spec = st.extra_services.get(name)
+    if spec is None:
+        raise click.ClickException(f"{name} was not added with `service add`" + (f" (added: {', '.join(sorted(st.extra_services))})" if st.extra_services else "; release services are turned off in `orizonctl configure`"))
+    if not yes and _on_terminal():
+        click.confirm(f"Stop and remove {name} ({spec.get('image')})?", default=True, abort=True)
+    mcp = bool(spec.get("mcp"))
+    if ctx.stack.has_file(mcp=mcp):
+        ctx.stack.run("rm", "-sf", name, mcp=mcp, check=False)
+    _unwire_connector(ctx, name, spec)
+    st.extra_services.pop(name)
+    st.save(ctx.app_dir)
+    ctx.sync_pins()
+    ui.ok(f"removed {name}")
+
+
+@service.command("list")
+@pass_ctx
+def service_list(ctx: Ctx) -> None:
+    """Added containers and pinned images."""
+    st = ctx.require_state()
+    if not (st.extra_services or st.image_pins or st.mcp_image_pins):
+        ui.info("nothing added or pinned: every service is the release's, at ORIZON_VERSION")
+        return
+    for name, spec in sorted(st.extra_services.items()):
+        ui.kv(name, f"added   {spec.get('image')}  [{'mcp' if spec.get('mcp') else 'main'}{', port ' + str(spec['port']) if spec.get('port') else ''}]")
+    for name, ref in sorted({**st.image_pins, **st.mcp_image_pins}.items()):
+        ui.kv(name, f"pinned  {ref}")
 
 
 # -------------------------------------------------------------- rollback
@@ -883,6 +1325,7 @@ def rollback(ctx: Ctx, snapshot: str | None, db_only: bool, no_db: bool, no_data
         ui.header("Files")
         restored = bk.restore_env(snap, ctx.app_dir)
         ui.ok(f"env files + state: {', '.join(restored)}")
+        ctx.sync_pins()  # the snapshot's state decides which services are pinned
         n = bk.restore_files(snap, ctx.app_dir)
         ui.ok(f"deployment files: {n} restored")
         if not no_data:
@@ -1189,6 +1632,10 @@ def info(ctx: Ctx) -> None:
         ui.kv("models", f"text={st.text_mode} embedding={st.embedding_mode} rerank={st.rerank_mode} transcription={'on' if st.transcription else 'off'}")
         ui.kv("mcp", ("on" + (f" (profiles: {', '.join(st.mcp_profiles)})" if st.mcp_profiles else "")) if st.mcp else "off")
         ui.kv("services", ", ".join(st.all_services()))
+        for s, ref in sorted({**st.image_pins, **st.mcp_image_pins}.items()):
+            ui.kv(f"pinned: {s}", ref)
+        for s, spec in sorted(st.extra_services.items()):
+            ui.kv(f"added: {s}", str(spec.get("image")))
     else:
         ui.kv("configured", "no (run orizonctl setup)")
     for f in EnvFile:

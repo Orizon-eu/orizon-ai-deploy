@@ -2,7 +2,7 @@
 # =============================================================================
 # Orizon AI — production installer for Ubuntu
 #
-#   curl -fsSL https://raw.githubusercontent.com/Orizon-eu/orizon-ai-deploy/main/install.sh | sudo bash
+#   curl -fsSL https://gitlab.syneto.eu/orizon-ai/orizon-ai-deploy/-/raw/main/install.sh | sudo bash
 #
 # The application source is private and never lands on the customer's machine.
 # This script installs the public `orizonctl` CLI, which carries the compose
@@ -45,7 +45,7 @@
 #                                  deploy project)
 #   ORIZON_CLI_SOURCE=<template>   pip spec for the CLI; {version} and {pyversion}  cli_source
 #                                  are substituted. Default: the public deploy
-#                                  project on GitHub, or, when this script is run
+#                                  project on GitLab, or, when this script is run
 #                                  from a repository checkout, the deploy/orizonctl
 #                                  directory next to it. A local path works too.
 #   ORIZON_INSTALL_ONLY=1          do not start setup at the end                   install_only
@@ -165,7 +165,7 @@ fi
 # project is the default.
 # The default is assigned via a helper variable on purpose: it contains
 # "{version}", and the "}" in it would end a ${VAR:-default} expansion early.
-DEFAULT_CLI_SOURCE='git+https://github.com/Orizon-eu/orizon-ai-deploy.git@{version}#subdirectory=orizonctl'
+DEFAULT_CLI_SOURCE='git+https://gitlab.syneto.eu/orizon-ai/orizon-ai-deploy.git@{version}#subdirectory=orizonctl'
 CLI_FROM_CHECKOUT=0
 if [ -z "${ORIZON_CLI_SOURCE:-}" ] && [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
   _here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

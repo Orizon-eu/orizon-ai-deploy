@@ -15,8 +15,8 @@ def test_registry_host_detection():
 
 
 def test_cli_spec_template():
-    t = "git+https://github.com/Orizon-eu/orizon-ai-deploy.git@{version}#subdirectory=orizonctl"
-    assert resolve_cli_spec(t, "v1.3.0") == "git+https://github.com/Orizon-eu/orizon-ai-deploy.git@v1.3.0#subdirectory=orizonctl"
+    t = "git+https://gitlab.syneto.eu/orizon-ai/orizon-ai-deploy.git@{version}#subdirectory=orizonctl"
+    assert resolve_cli_spec(t, "v1.3.0") == "git+https://gitlab.syneto.eu/orizon-ai/orizon-ai-deploy.git@v1.3.0#subdirectory=orizonctl"
     assert resolve_cli_spec("orizonctl=={pyversion}", "v1.3.0") == "orizonctl==1.3.0"
 
 

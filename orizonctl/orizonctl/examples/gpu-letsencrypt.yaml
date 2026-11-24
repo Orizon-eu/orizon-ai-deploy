@@ -1,18 +1,18 @@
 # Full stack on one GPU host: local text, embedding and rerank servers, HTTPS
 # via nginx with a Let's Encrypt certificate (Cloudflare DNS-01), connectors on.
 #
-#   curl -fsSL https://raw.githubusercontent.com/Orizon-eu/orizon-ai-deploy/main/install.sh \
+#   curl -fsSL https://gitlab.syneto.eu/orizon-ai/orizon-ai-deploy/-/raw/main/install.sh \
 #     | sudo bash -s -- --config /root/orizon.yaml
 #
 # Fill in the three tokens. Everything not listed keeps its default; see
 # `orizonctl config example reference` for every key.
 
 install:
-  version: v1.3.0
+  version: v1.2.0
   interactive: false           # unattended; true runs the wizard with these answers pre-filled
 
 configure:
-  version: v1.3.0
+  version: v1.2.0
 
   registry:
     prefix: scr.syneto.eu/orizon-ai/orizon-ai

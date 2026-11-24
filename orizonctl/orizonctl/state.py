@@ -39,6 +39,12 @@ class State:
     download_models: bool = False
     configured_at: str = ""
     orizonctl_version: str = ""
+    # service -> image reference, for services moved off ORIZON_VERSION (see pins.py)
+    image_pins: dict = field(default_factory=dict)
+    mcp_image_pins: dict = field(default_factory=dict)
+    # service -> {image, mcp, port, publish, env, cred_vars, wired}: containers added with
+    # `orizonctl service add`, which the release's compose files do not define
+    extra_services: dict = field(default_factory=dict)
     extra: dict = field(default_factory=dict)
 
     # ---------------------------------------------------------------- queries
@@ -80,6 +86,9 @@ class State:
         out = ["frontend", "backend"]
         if self.transcription:
             out.append("transcription-bot")
+        # added containers of the main stack start with the application (the
+        # MCP stack is brought up whole, so its added ones need no listing)
+        out += [n for n, s in sorted(self.extra_services.items()) if not s.get("mcp") and n not in out]
         return out
 
     def edge_services(self) -> list[str]:
@@ -119,6 +128,9 @@ class State:
         if self.uses_nginx:
             ports[p("NGINX_HTTP_PORT", 80)] = "nginx (http)"
             ports[p("NGINX_HTTPS_PORT", 443)] = "nginx (https)"
+        for name, spec in self.extra_services.items():
+            if spec.get("port") and spec.get("publish") and (self.mcp or not spec.get("mcp")):
+                ports[int(spec["port"])] = name
         if self.mcp:
             from .schema import MCP_PORTS
 

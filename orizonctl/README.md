@@ -12,6 +12,9 @@ orizonctl up | down | restart | status | logs | pull
 orizonctl doctor       # post-deploy health report
 orizonctl backup       # snapshot (db, env, deployment files, client data) into $ORIZON_HOME/backups
 orizonctl update       # snapshot, pull the new images, new orizonctl + files, migrate env keys, up
+orizonctl update backend --version v1.3.1   # one service on another image (--image REF, --unpin); the rest stays
+orizonctl service add mcp-imap --port 8111  # a container the release's compose files lack; also remove | list
+orizonctl self-update   # reinstall orizonctl + its bundled files at the running release (--ref main); no restart
 orizonctl rollback     # back to a snapshot: files, database, images
 orizonctl models download
 orizonctl ssl issue | status
