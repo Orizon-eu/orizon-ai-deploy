@@ -126,24 +126,64 @@ def primary_ip() -> str:
 class Gpu:
     index: int
     name: str
-    memory_mib: int
+    memory_mib: int   # 0 when nvidia-smi cannot say
     driver: str
+    unified: bool = False  # memory shared with the host (GB10 / DGX Spark, Jetson)
+
+    def memory_label(self) -> str:
+        if self.memory_mib <= 0:
+            return "memory n/a"
+        return f"{self.memory_mib // 1024} GiB" + (" unified" if self.unified else "")
+
+
+def _host_mem_mib() -> int:
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def _gpu_memory(field: str) -> tuple[int, bool]:
+    """memory.total as MiB. Unified-memory parts (GB10 / DGX Spark, Jetson)
+    report `[N/A]`; there the host RAM is the GPU memory."""
+    try:
+        return int(float(field)), False
+    except ValueError:
+        return _host_mem_mib(), True
 
 
 def nvidia_gpus() -> list[Gpu]:
+    """Every GPU nvidia-smi can see. A GPU whose memory does not parse is kept
+    (it used to be dropped, which made a DGX Spark look GPU-less); when the CSV
+    query fails outright, `nvidia-smi -L` is tried, as install.sh does."""
     r = run(["nvidia-smi", "--query-gpu=index,name,memory.total,driver_version", "--format=csv,noheader,nounits"])
+    gpus: list[Gpu] = []
+    if r.returncode == 0:
+        for line in r.stdout.strip().splitlines():
+            parts = [x.strip() for x in line.split(",")]
+            if len(parts) < 4:
+                continue
+            try:
+                index = int(parts[0])
+            except ValueError:
+                continue
+            mem, unified = _gpu_memory(parts[2])
+            gpus.append(Gpu(index, parts[1], mem, parts[3], unified))
+    return gpus or _nvidia_gpus_from_list()
+
+
+def _nvidia_gpus_from_list() -> list[Gpu]:
+    """`nvidia-smi -L` lines look like `GPU 0: NVIDIA GB10 (UUID: GPU-...)`."""
+    r = run(["nvidia-smi", "-L"])
     if r.returncode != 0:
         return []
-    gpus = []
-    for line in r.stdout.strip().splitlines():
-        parts = [x.strip() for x in line.split(",")]
-        if len(parts) < 4:
-            continue
-        try:
-            gpus.append(Gpu(int(parts[0]), parts[1], int(float(parts[2])), parts[3]))
-        except ValueError:
-            continue
-    return gpus
+    d = run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"])
+    driver = (d.stdout.strip().splitlines() or ["unknown"])[0].strip() if d.returncode == 0 else "unknown"
+    return [Gpu(int(m.group(1)), m.group(2).strip(), 0, driver or "unknown")
+            for m in re.finditer(r"^GPU (\d+): (.+?)(?: \(UUID:.*\))?\s*$", r.stdout, re.M)]
 
 
 def nvidia_hardware_present() -> bool:

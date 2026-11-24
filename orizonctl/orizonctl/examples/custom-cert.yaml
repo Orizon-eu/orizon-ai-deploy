@@ -3,7 +3,7 @@
 # servers, the reranker served by another machine, Orizon Transcribe on with
 # its Telegram bot.
 #
-#   curl -fsSL https://gitlab.syneto.eu/orizon-ai/orizon-ai-deploy/-/raw/main/install.sh \
+#   curl -fsSL https://raw.githubusercontent.com/Orizon-eu/orizon-ai-deploy/main/install.sh \
 #     | sudo bash -s -- --config /root/orizon.yaml
 #
 # Put the two PEM files in /opt/orizon/app/certs before `orizonctl up`
@@ -11,10 +11,10 @@
 
 install:
   home: /opt/orizon
-  version: v1.2.0
+  version: v1.3.0
 
 configure:
-  version: v1.2.0
+  version: v1.3.0
 
   registry:
     prefix: scr.syneto.eu/orizon-ai/orizon-ai

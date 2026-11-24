@@ -5,7 +5,7 @@ then asks a dozen questions, writes every env file the stack needs, downloads
 the model weights and brings the containers up in the right order.
 
 ```bash
-curl -fsSL https://gitlab.syneto.eu/orizon-ai/orizon-ai-deploy/-/raw/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Orizon-eu/orizon-ai-deploy/main/install.sh | sudo bash
 ```
 
 ## 0. Distribution model
@@ -14,7 +14,7 @@ Three things reach a customer host, and the application source is not one of the
 
 | What | Where it lives | Visibility | How it gets to the host |
 |---|---|---|---|
-| `install.sh` | public project `orizon-ai/orizon-ai-deploy` on GitLab | public | `curl` |
+| `install.sh` | public project `Orizon-eu/orizon-ai-deploy` on GitHub | public | `curl` |
 | `orizonctl` + the deployment files it carries (compose files, env templates, nginx templates, helper scripts) | same public project, `orizonctl/`; released as tags `vX.Y.Z` | public | `pip install git+…@vX.Y.Z#subdirectory=orizonctl` into `/opt/orizon/venv` |
 | container images | Harbor: pushed to `harbor.syneto.eu/orizon-ai`, pulled through the proxy cache `scr.syneto.eu/orizon-ai/orizon-ai` | private | `docker pull`, after the `docker login` the wizard performs with a robot account |
 | application source (this monorepo, four submodules) | `gitlab.syneto.eu/orizon-ai/*` | private | never |
@@ -340,7 +340,7 @@ One YAML file carries the whole install. `install:` is read by `install.sh`
 per question, and is what `orizonctl setup` and `configure` read.
 
 ```bash
-curl -fsSL https://gitlab.syneto.eu/orizon-ai/orizon-ai-deploy/-/raw/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/Orizon-eu/orizon-ai-deploy/main/install.sh \
   | sudo bash -s -- --config /root/orizon.yaml          # install, then `orizonctl setup --non-interactive --config`
 sudo orizonctl setup --non-interactive --config /root/orizon.yaml     # on a host where install.sh already ran
 sudo orizonctl configure --config /root/orizon.yaml                   # re-configure; answered questions are not asked
@@ -511,7 +511,7 @@ docker login harbor.syneto.eu
 git commit -am "Release vX.Y.Z"
 
 # 3. publish install.sh + orizonctl/ to the public project and tag it
-git clone git@gitlab.syneto.eu:orizon-ai/orizon-ai-deploy.git ../orizon-ai-deploy   # once
+git clone git@github.com:Orizon-eu/orizon-ai-deploy.git ../orizon-ai-deploy   # once
 ./deploy/publish-installer.sh vX.Y.Z ../orizon-ai-deploy --push
 ```
 

@@ -2,15 +2,15 @@
 # HTTP via nginx on port 80 (LAN or evaluation). Only db, backend, frontend and
 # nginx run; no model server.
 #
-#   curl -fsSL https://gitlab.syneto.eu/orizon-ai/orizon-ai-deploy/-/raw/main/install.sh \
+#   curl -fsSL https://raw.githubusercontent.com/Orizon-eu/orizon-ai-deploy/main/install.sh \
 #     | sudo bash -s -- --config /root/orizon.yaml
 
 install:
-  version: v1.2.0
+  version: v1.3.0
   skip_nvidia: true
 
 configure:
-  version: v1.2.0
+  version: v1.3.0
 
   registry:
     prefix: scr.syneto.eu/orizon-ai/orizon-ai

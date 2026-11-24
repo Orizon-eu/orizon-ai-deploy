@@ -1,7 +1,7 @@
 # Every key the installer and the wizard read, with its default. Copy, delete
 # what you do not need, fill in the rest.
 #
-#   curl -fsSL https://gitlab.syneto.eu/orizon-ai/orizon-ai-deploy/-/raw/main/install.sh \
+#   curl -fsSL https://raw.githubusercontent.com/Orizon-eu/orizon-ai-deploy/main/install.sh \
 #     | sudo bash -s -- --config /root/orizon.yaml
 #
 #   sudo orizonctl config check /root/orizon.yaml                     # typos, what will be read
@@ -33,7 +33,7 @@ install:
   skip_nvidia: false           # true: never touch the NVIDIA container toolkit
 
 configure:
-  version: v1.2.0              # image tag to deploy (ORIZON_VERSION); every service is pulled at this tag
+  version: v1.3.0              # image tag to deploy (ORIZON_VERSION); every service is pulled at this tag
 
   registry:
     prefix: scr.syneto.eu/orizon-ai/orizon-ai   # registry host + project path, no trailing slash;

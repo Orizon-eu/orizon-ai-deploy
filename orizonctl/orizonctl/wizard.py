@@ -249,7 +249,7 @@ class Wizard:
         version = self.ask(
             "Image tag to deploy (ORIZON_VERSION)",
             answer=self.a("version"),
-            default=self.cur("ORIZON_VERSION", "v1.2.0"),
+            default=self.cur("ORIZON_VERSION", "v1.3.0"),
             required=True,
             validate=lambda v: None if str(v).startswith("v") else "tags look like v1.2.0",
             help="Every service is pulled from the registry at this tag. Release tags look like v1.2.0; a dev build like v1.2.0_dev works too.\nThe next section lists the tags the registry actually holds and lets you correct this.",
@@ -383,7 +383,7 @@ class Wizard:
         ui.header("Models")
         if self.gpus:
             for g in self.gpus:
-                ui.kv(f"GPU {g.index}", f"{g.name}, {g.memory_mib // 1024} GiB, driver {g.driver}")
+                ui.kv(f"GPU {g.index}", f"{g.name}, {g.memory_label()}, driver {g.driver}")
         else:
             ui.info("No NVIDIA GPU detected: every model has to come from an external OpenAI-compatible endpoint.")
 

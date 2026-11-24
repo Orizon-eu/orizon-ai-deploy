@@ -442,7 +442,8 @@ def pull(ctx: Ctx) -> None:
     try:
         ctx.stack.pull([s for s in st.all_services() if s in ctx.stack.config_services()])
         if st.mcp and ctx.stack.has_file(mcp=True):
-            ctx.stack.pull([], mcp=True)
+            services, _ = ctx.stack.connector_services(ctx.values.get("ORIZON_IMAGE_PREFIX") or st.image_prefix)
+            ctx.stack.pull(services, mcp=True)
     except ComposeError as e:
         raise click.ClickException(str(e))
     ui.ok("images pulled")
@@ -615,7 +616,8 @@ def _pull_target(ctx: Ctx, st: State, target: str) -> None:
     ui.step(f"Pulling images at {target}")
     ctx.stack.pull(services, env={"ORIZON_VERSION": target})
     if st.mcp and ctx.stack.has_file(mcp=True):
-        ctx.stack.pull([], mcp=True, env={"ORIZON_VERSION": target})
+        connectors, _ = ctx.stack.connector_services(prefix, env={"ORIZON_VERSION": target})
+        ctx.stack.pull(connectors, mcp=True, env={"ORIZON_VERSION": target})
 
 
 def _parse_sets(sets: tuple[str, ...]) -> dict[str, str]:
